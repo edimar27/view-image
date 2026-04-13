@@ -515,7 +515,7 @@ def _camera_brand_badge_widget(make_raw: object) -> ft.Control | None:
         return ft.Container(
             padding=ft.Padding.all(10),
             bgcolor=ft.Colors.with_opacity(0.45, ft.Colors.BLACK),
-            border_radius=ft.border_radius.all(8),
+            border_radius=ft.BorderRadius.all(8),
             content=ft.Image(
                 src=_flet_image_display_src(str(logo_path)),
                 width=52,
@@ -530,7 +530,7 @@ def _camera_brand_badge_widget(make_raw: object) -> ft.Control | None:
     return ft.Container(
         padding=ft.Padding.symmetric(horizontal=10, vertical=6),
         bgcolor=ft.Colors.with_opacity(0.55, ft.Colors.BLACK),
-        border_radius=ft.border_radius.all(6),
+        border_radius=ft.BorderRadius.all(6),
         content=ft.Text(
             short.upper(),
             size=10,
@@ -2429,27 +2429,76 @@ def collect_images_from_dir(folder: Path) -> list[Path]:
     return out
 
 
+def _path_resolve_key(p: str) -> str:
+    try:
+        return str(Path(p).resolve())
+    except Exception:
+        return p
+
+
 def _merge_unique_image_paths(existing: list[str], new_items: list[str]) -> list[str]:
     """Mantém ordem; evita o mesmo ficheiro duas vezes (por caminho resolvido)."""
     seen: set[str] = set()
     out: list[str] = []
     for p in existing:
-        try:
-            key = str(Path(p).resolve())
-        except Exception:
-            key = p
+        key = _path_resolve_key(p)
         if key not in seen:
             seen.add(key)
             out.append(p)
     for p in new_items:
-        try:
-            key = str(Path(p).resolve())
-        except Exception:
-            key = p
+        key = _path_resolve_key(p)
         if key not in seen:
             seen.add(key)
             out.append(p)
     return out
+
+
+def _merge_paths_and_groups(
+    existing: list[str],
+    existing_groups: list[str],
+    new_paths: list[str],
+    new_groups: list[str],
+) -> tuple[list[str], list[str]]:
+    """Igual a `_merge_unique_image_paths`, mas mantém o grupo por índice."""
+    if len(existing) != len(existing_groups):
+        raise ValueError("existing / existing_groups length mismatch")
+    if len(new_paths) != len(new_groups):
+        raise ValueError("new_paths / new_groups length mismatch")
+    seen: set[str] = set()
+    out_p: list[str] = []
+    out_g: list[str] = []
+    for p, g in zip(existing, existing_groups, strict=True):
+        key = _path_resolve_key(p)
+        if key not in seen:
+            seen.add(key)
+            out_p.append(p)
+            out_g.append(g)
+    for p, g in zip(new_paths, new_groups, strict=True):
+        key = _path_resolve_key(p)
+        if key not in seen:
+            seen.add(key)
+            out_p.append(p)
+            out_g.append(g)
+    return out_p, out_g
+
+
+def _infer_thumb_group_roots(paths: list[str]) -> list[str]:
+    """Uma chave por imagem: pasta-mãe (ficheiros soltos) ou raiz comum."""
+    out: list[str] = []
+    for p in paths:
+        try:
+            out.append(str(Path(p).resolve().parent))
+        except Exception:
+            out.append(str(Path(p).expanduser().parent))
+    return out
+
+
+def _thumb_group_heading_text(group_key: str) -> str:
+    try:
+        name = Path(group_key).name
+        return name if name else group_key
+    except Exception:
+        return group_key
 
 
 def _image_paths_from_argv() -> list[Path]:
@@ -2511,7 +2560,20 @@ def main(page: ft.Page) -> None:
         size=13,
         opacity=0.8,
     )
-    show_thumbs = ft.Switch(label=tr("label_thumbnails"), value=True)
+    _sw_compact = {
+        "label_text_style": ft.TextStyle(size=11),
+        "padding": ft.Padding.symmetric(horizontal=0, vertical=0),
+    }
+    show_thumbs = ft.Switch(
+        label=tr("label_thumbnails"),
+        value=True,
+        **_sw_compact,
+    )
+
+    # Painel esquerdo retrátil: menu + EXIF + miniaturas (área direita só para a foto).
+    sidebar_open: list[bool] = [True]
+    SIDEBAR_W_EXPANDED = 300
+    SIDEBAR_W_COLLAPSED = 40
 
     page_view = ft.PageView(
         expand=True,
@@ -2521,11 +2583,64 @@ def main(page: ft.Page) -> None:
         clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
     )
 
-    thumb_row = ft.Row(
-        scroll=ft.ScrollMode.AUTO,
-        spacing=8,
-        alignment=ft.MainAxisAlignment.START,
-    )
+    # Flet 0.84 não expõe `Wrap`. Usamos Column de Rows (largura do painel) para não
+    # aninhar GridView+scroll com altura ilimitada.
+    _thumb_inner_w = max(72, int(SIDEBAR_W_EXPANDED - 28))
+    thumb_wrap = ft.Column(spacing=8, tight=True, controls=[])
+
+    def _relayout_thumb_rows() -> None:
+        thumb_wrap.controls.clear()
+        n = len(thumb_refs)
+        if n == 0:
+            return
+        gap = 8
+        cell = 72 + gap
+        per_row = max(1, (_thumb_inner_w + gap) // cell)
+        groups = gallery_group_roots
+        if len(groups) != n:
+            groups = _infer_thumb_group_roots(gallery_paths)
+        show_sections = len({*groups}) > 1
+
+        def _row_chunk(start: int, end: int) -> None:
+            for k in range(start, end, per_row):
+                chunk = thumb_refs[k : k + per_row]
+                thumb_wrap.controls.append(
+                    ft.Row(
+                        spacing=gap,
+                        alignment=ft.MainAxisAlignment.START,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=list(chunk),
+                    )
+                )
+
+        if not show_sections:
+            _row_chunk(0, n)
+            return
+
+        i = 0
+        while i < n:
+            gkey = groups[i]
+            j = i + 1
+            while j < n and groups[j] == gkey:
+                j += 1
+            title = _thumb_group_heading_text(gkey)
+            thumb_wrap.controls.append(
+                ft.Container(
+                    width=float(_thumb_inner_w),
+                    padding=ft.Padding.only(top=6 if i > 0 else 0, bottom=2),
+                    tooltip=gkey,
+                    content=ft.Text(
+                        title,
+                        size=11,
+                        weight=ft.FontWeight.W_600,
+                        opacity=0.82,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        max_lines=1,
+                    ),
+                )
+            )
+            _row_chunk(i, j)
+            i = j
 
     thumb_selected: set[int] = set()
     thumb_select_btns: list[ft.IconButton] = []
@@ -2561,16 +2676,10 @@ def main(page: ft.Page) -> None:
                         ),
                     ],
                 ),
-                thumb_row,
+                thumb_wrap,
             ],
         ),
     )
-
-    def on_toggle_thumbs(_: ft.ControlEvent) -> None:
-        thumb_strip.visible = show_thumbs.value
-        page.update()
-
-    show_thumbs.on_change = on_toggle_thumbs
 
     btn_prev = ft.IconButton(
         icon=ft.Icons.CHEVRON_LEFT,
@@ -2623,7 +2732,7 @@ def main(page: ft.Page) -> None:
 
     def highlight_thumb(idx: int) -> None:
         for i, box in enumerate(thumb_refs):
-            box.border = ft.border.all(
+            box.border = ft.Border.all(
                 2,
                 ft.Colors.PRIMARY if i == idx else ft.Colors.TRANSPARENT,
             )
@@ -2644,10 +2753,10 @@ def main(page: ft.Page) -> None:
     exif_strip_opacity: float = 0.58
     exif_strip_placement: str = "auto"
 
-    exif_sw_soft = ft.Switch(label=tr("label_software"), value=True)
-    exif_sw_date = ft.Switch(label=tr("label_capture_date"), value=True)
-    exif_sw_mode = ft.Switch(label=tr("label_mode"), value=True)
-    exif_show_strip = ft.Switch(label=tr("label_exif_strip"), value=True)
+    exif_sw_soft = ft.Switch(label=tr("label_software"), value=True, **_sw_compact)
+    exif_sw_date = ft.Switch(label=tr("label_capture_date"), value=True, **_sw_compact)
+    exif_sw_mode = ft.Switch(label=tr("label_mode"), value=True, **_sw_compact)
+    exif_show_strip = ft.Switch(label=tr("label_exif_strip"), value=True, **_sw_compact)
 
     def _get_exif_filter() -> ExifDisplayFilter:
         return ExifDisplayFilter(
@@ -2774,9 +2883,11 @@ def main(page: ft.Page) -> None:
     def _estimate_exif_viewport_px() -> tuple[int, int]:
         ww = int(page.window.width or 1100)
         wh = int(page.window.height or 800)
-        pw = max(220, ww - 96)
-        # Menos cromo subestimado → área do slide mais alta; evita sy=0 quando ph−h_e≤0
-        ph = max(160, wh - 220)
+        sw = SIDEBAR_W_EXPANDED if sidebar_open[0] else SIDEBAR_W_COLLAPSED
+        # Área útil da foto à direita (sem painel lateral nem margens).
+        pw = max(220, ww - 96 - sw)
+        # Barra EXIF/miniaturas passou para o painel esquerdo — mais altura para o slide.
+        ph = max(160, wh - 100)
         return pw, ph
 
     def _apply_exif_strip_positions() -> None:
@@ -2949,7 +3060,7 @@ def main(page: ft.Page) -> None:
         page.update()
 
     dd_exif_placement = ft.Dropdown(
-        width=360,
+        width=260,
         dense=True,
         value="auto",
         label=tr("strip_placement_label"),
@@ -2978,28 +3089,43 @@ def main(page: ft.Page) -> None:
         value=0.58,
         divisions=18,
         label=tr("label_opacity"),
-        width=240,
+        width=260,
         on_change=on_exif_opacity_changed,
     )
 
     gallery_paths: list[str] = []
+    gallery_group_roots: list[str] = []
     _picker_temp_paths: list[str] = []
 
     def rebuild_gallery(
         paths: list[Path | str],
         *,
         extend: bool = False,
+        group_roots: list[str] | None = None,
     ) -> None:
-        nonlocal thumb_refs, gallery_paths, _picker_temp_paths
+        nonlocal thumb_refs, gallery_paths, gallery_group_roots, _picker_temp_paths
         prior_len = len(gallery_paths)
         new_paths = [str(p) for p in paths]
+        if new_paths:
+            if group_roots is not None:
+                if len(group_roots) != len(new_paths):
+                    raise ValueError("group_roots must match paths length")
+                gr = [str(g) for g in group_roots]
+            else:
+                gr = _infer_thumb_group_roots(new_paths)
+        else:
+            gr = []
+
         if extend:
             if not new_paths:
                 return
-            merged = _merge_unique_image_paths(gallery_paths, new_paths)
+            merged, merged_g = _merge_paths_and_groups(
+                gallery_paths, gallery_group_roots, new_paths, gr
+            )
             if merged == gallery_paths:
                 return
             gallery_paths = merged
+            gallery_group_roots = merged_g
         else:
             for tp in _picker_temp_paths:
                 try:
@@ -3008,11 +3134,12 @@ def main(page: ft.Page) -> None:
                     pass
             _picker_temp_paths.clear()
             gallery_paths = list(new_paths)
+            gallery_group_roots = list(gr)
 
         paths = gallery_paths
         thumb_refs = []
         page_view.controls.clear()
-        thumb_row.controls.clear()
+        thumb_wrap.controls.clear()
         slide_merges.clear()
         exif_bar_refs.clear()
         exif_strip_wrap_refs.clear()
@@ -3206,7 +3333,7 @@ def main(page: ft.Page) -> None:
                 border_radius=8,
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                 bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
-                border=ft.border.all(2, ft.Colors.TRANSPARENT),
+                border=ft.Border.all(2, ft.Colors.TRANSPARENT),
                 content=ft.Stack(
                     clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                     controls=[
@@ -3232,7 +3359,7 @@ def main(page: ft.Page) -> None:
                             height=34,
                             alignment=ft.Alignment.CENTER,
                             bgcolor=ft.Colors.with_opacity(0.45, ft.Colors.BLACK),
-                            border_radius=ft.border_radius.only(
+                            border_radius=ft.BorderRadius.only(
                                 bottom_left=6,
                             ),
                             content=sel_btn,
@@ -3241,7 +3368,8 @@ def main(page: ft.Page) -> None:
                 ),
             )
             thumb_refs.append(t)
-            thumb_row.controls.append(t)
+
+        _relayout_thumb_rows()
 
         if extend and len(paths) > prior_len:
             page_view.selected_index = prior_len
@@ -3279,6 +3407,56 @@ def main(page: ft.Page) -> None:
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
     _file_picker_keepalive.append(file_picker)
+
+    _gallery_loading_layer: list[ft.Control | None] = [None]
+
+    def _hide_gallery_loading() -> None:
+        layer = _gallery_loading_layer[0]
+        if layer is not None:
+            try:
+                if layer in page.overlay:
+                    page.overlay.remove(layer)
+            except ValueError:
+                pass
+            _gallery_loading_layer[0] = None
+        page.update()
+
+    def _show_gallery_loading(message: str) -> None:
+        _hide_gallery_loading()
+        layer = ft.Container(
+            expand=True,
+            bgcolor=ft.Colors.with_opacity(0.45, ft.Colors.BLACK),
+            alignment=ft.Alignment.CENTER,
+            content=ft.Container(
+                width=320,
+                padding=ft.Padding.symmetric(horizontal=28, vertical=22),
+                bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                border_radius=12,
+                shadow=[
+                    ft.BoxShadow(
+                        blur_radius=20,
+                        spread_radius=0,
+                        color=ft.Colors.with_opacity(0.35, ft.Colors.BLACK),
+                        offset=ft.Offset(0, 6),
+                    ),
+                ],
+                content=ft.Row(
+                    spacing=18,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.ProgressRing(width=32, height=32),
+                        ft.Text(
+                            message,
+                            size=14,
+                            weight=ft.FontWeight.W_500,
+                        ),
+                    ],
+                ),
+            ),
+        )
+        _gallery_loading_layer[0] = layer
+        page.overlay.append(layer)
+        page.update()
 
     def _exif_strip_export_kwargs() -> dict[str, object]:
         vpw, vph = _estimate_exif_viewport_px()
@@ -3525,7 +3703,7 @@ def main(page: ft.Page) -> None:
         page.snack_bar.open = True
         page.update()
 
-    async def _open_folder_async() -> None:
+    async def _open_folder_async(extend: bool = True) -> None:
         if page.web:
             page.snack_bar = ft.SnackBar(
                 content=ft.Text(tr("snack_web_use_select"))
@@ -3552,17 +3730,28 @@ def main(page: ft.Page) -> None:
             path = None
         if not path:
             return
-        imgs = collect_images_from_dir(Path(path))
-        if not imgs:
-            page.snack_bar = ft.SnackBar(
-                content=ft.Text(tr("snack_no_images_folder"))
+        _show_gallery_loading(tr("loading_gallery_folder"))
+        try:
+            await asyncio.sleep(0)
+            imgs = collect_images_from_dir(Path(path))
+            if not imgs:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text(tr("snack_no_images_folder"))
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
+            root_key = str(Path(path).resolve())
+            paths_str = [str(p) for p in imgs]
+            rebuild_gallery(
+                paths_str,
+                extend=extend,
+                group_roots=[root_key] * len(paths_str),
             )
-            page.snack_bar.open = True
-            page.update()
-            return
-        rebuild_gallery([str(p) for p in imgs], extend=True)
+        finally:
+            _hide_gallery_loading()
 
-    async def _pick_files_async() -> None:
+    async def _pick_files_async(extend: bool = True) -> None:
         nonlocal _picker_temp_paths
         await asyncio.sleep(0.15)
         try:
@@ -3587,33 +3776,45 @@ def main(page: ft.Page) -> None:
             raise
         if not files:
             return
-        paths: list[str] = []
-        for f in files:
-            p = getattr(f, "path", None)
-            if p:
-                paths.append(str(p))
-                continue
-            raw = getattr(f, "bytes", None)
-            if raw:
-                name = getattr(f, "name", "") or tr("picker_default_name")
-                sfx = (Path(str(name)).suffix or ".jpg").lower()
-                if sfx not in IMAGE_EXTENSIONS:
-                    sfx = ".jpg"
-                fd, tmp_path = tempfile.mkstemp(prefix="edimg_", suffix=sfx)
-                try:
-                    os.write(fd, raw)
-                finally:
-                    os.close(fd)
-                paths.append(tmp_path)
-                _picker_temp_paths.append(tmp_path)
-        if not paths:
-            page.snack_bar = ft.SnackBar(
-                content=ft.Text(tr("snack_files_unreadable"))
-            )
-            page.snack_bar.open = True
-            page.update()
-            return
-        rebuild_gallery(paths, extend=True)
+        _show_gallery_loading(tr("loading_gallery_images"))
+        try:
+            await asyncio.sleep(0)
+            paths: list[str] = []
+            for f in files:
+                p = getattr(f, "path", None)
+                if p:
+                    paths.append(str(p))
+                    continue
+                raw = getattr(f, "bytes", None)
+                if raw:
+                    name = getattr(f, "name", "") or tr("picker_default_name")
+                    sfx = (Path(str(name)).suffix or ".jpg").lower()
+                    if sfx not in IMAGE_EXTENSIONS:
+                        sfx = ".jpg"
+                    fd, tmp_path = tempfile.mkstemp(prefix="edimg_", suffix=sfx)
+                    try:
+                        os.write(fd, raw)
+                    finally:
+                        os.close(fd)
+                    paths.append(tmp_path)
+                    _picker_temp_paths.append(tmp_path)
+            if not paths:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text(tr("snack_files_unreadable"))
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
+            gr = [str(Path(p).resolve().parent) for p in paths]
+            rebuild_gallery(paths, extend=extend, group_roots=gr)
+        finally:
+            _hide_gallery_loading()
+
+    async def _new_gallery_from_folder_async() -> None:
+        await _open_folder_async(extend=False)
+
+    async def _new_gallery_from_files_async() -> None:
+        await _pick_files_async(extend=False)
 
     def pick_folder_click(_: ft.ControlEvent) -> None:
         page.run_task(_open_folder_async)
@@ -3624,59 +3825,303 @@ def main(page: ft.Page) -> None:
     def clear_gallery_click(_: ft.ControlEvent) -> None:
         rebuild_gallery([], extend=False)
 
-    page.appbar = ft.AppBar(
-        title=ft.Column(
-            tight=True,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=2,
-            controls=[
-                ft.Text("Ed Image Preview"),
-                ft.Text(
-                    "By Edimar Barbosa - ©2026",
-                    size=11,
-                    opacity=0.72,
+    def open_about_dialog(_: ft.ControlEvent) -> None:
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(
+                "Ed Image Preview",
+                size=20,
+                weight=ft.FontWeight.W_600,
+            ),
+            content=ft.Container(
+                width=400,
+                padding=ft.Padding.only(top=4, bottom=8),
+                content=ft.Text(
+                    tr("about_body"),
+                    size=14,
+                    height=1.45,
+                ),
+            ),
+            actions=[
+                ft.TextButton(
+                    tr("about_ok"),
+                    on_click=lambda _e: _close_about(),
                 ),
             ],
-        ),
-        center_title=True,
-        bgcolor=ft.Colors.SURFACE_CONTAINER,
-        actions=[
-            ft.IconButton(
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+        def _close_about() -> None:
+            dlg.open = False
+            page.update()
+
+        page.dialog = dlg
+        dlg.open = True
+        page.update()
+
+    _menu_file = ft.PopupMenuButton(
+        icon=ft.Icons.FOLDER,
+        tooltip=tr("menu_file"),
+        menu_position=ft.PopupMenuPosition.UNDER,
+        items=[
+            ft.PopupMenuItem(
+                content=tr("menu_item_add_folder"),
                 icon=ft.Icons.FOLDER_OPEN,
-                tooltip=tr("tooltip_add_folder"),
-                on_click=pick_folder_click,
-                disabled=page.web,
+                on_click=lambda _: pick_folder_click(_),
             ),
-            ft.IconButton(
-                icon=ft.Icons.COLLECTIONS,
-                tooltip=tr("tooltip_add_images"),
-                on_click=pick_files_click,
+            ft.PopupMenuItem(
+                content=tr("menu_item_add_images"),
+                icon=ft.Icons.ADD_PHOTO_ALTERNATE,
+                on_click=lambda _: pick_files_click(_),
             ),
-            ft.IconButton(
+            ft.PopupMenuItem(),
+            ft.PopupMenuItem(
+                content=tr("menu_item_clear"),
                 icon=ft.Icons.DELETE_OUTLINE,
-                tooltip=tr("tooltip_clear"),
-                on_click=clear_gallery_click,
-            ),
-            ft.IconButton(
-                icon=ft.Icons.SAVE_AS,
-                tooltip=tr("tooltip_save_current"),
-                on_click=lambda _: page.run_task(_save_current_with_strip_async),
-                disabled=page.web,
-            ),
-            ft.IconButton(
-                icon=ft.Icons.LIBRARY_ADD_CHECK,
-                tooltip=tr("tooltip_save_marked"),
-                on_click=lambda _: page.run_task(_save_selected_with_strip_async),
-                disabled=page.web,
-            ),
-            ft.IconButton(
-                icon=ft.Icons.FOLDER_SPECIAL,
-                tooltip=tr("tooltip_save_all"),
-                on_click=lambda _: page.run_task(_save_all_with_strip_async),
-                disabled=page.web,
+                on_click=lambda _: clear_gallery_click(_),
             ),
         ],
     )
+    _menu_export = ft.PopupMenuButton(
+        icon=ft.Icons.SAVE_OUTLINED,
+        tooltip=tr("menu_export"),
+        menu_position=ft.PopupMenuPosition.UNDER,
+        items=[
+            ft.PopupMenuItem(
+                content=tr("menu_item_save_current"),
+                icon=ft.Icons.SAVE_AS,
+                on_click=lambda _: page.run_task(_save_current_with_strip_async),
+            ),
+            ft.PopupMenuItem(
+                content=tr("menu_item_save_marked"),
+                icon=ft.Icons.LIBRARY_ADD_CHECK,
+                on_click=lambda _: page.run_task(_save_selected_with_strip_async),
+            ),
+            ft.PopupMenuItem(
+                content=tr("menu_item_save_all"),
+                icon=ft.Icons.FOLDER_SPECIAL,
+                on_click=lambda _: page.run_task(_save_all_with_strip_async),
+            ),
+        ],
+    )
+    _menu_help = ft.PopupMenuButton(
+        icon=ft.Icons.HELP_OUTLINE,
+        tooltip=tr("menu_help"),
+        menu_position=ft.PopupMenuPosition.UNDER,
+        items=[
+            ft.PopupMenuItem(
+                content=tr("menu_item_about"),
+                icon=ft.Icons.INFO_OUTLINE,
+                on_click=open_about_dialog,
+            ),
+        ],
+    )
+
+    btn_new_gallery = ft.PopupMenuButton(
+        icon=ft.Icons.AUTO_AWESOME_MOSAIC,
+        tooltip=tr("tooltip_new_gallery"),
+        menu_position=ft.PopupMenuPosition.UNDER,
+        items=[
+            ft.PopupMenuItem(
+                content=tr("menu_new_gallery_folder"),
+                icon=ft.Icons.FOLDER_OPEN,
+                on_click=lambda _: page.run_task(_new_gallery_from_folder_async),
+            ),
+            ft.PopupMenuItem(
+                content=tr("menu_new_gallery_files"),
+                icon=ft.Icons.ADD_PHOTO_ALTERNATE,
+                on_click=lambda _: page.run_task(_new_gallery_from_files_async),
+            ),
+        ],
+    )
+
+    menus_row = ft.Row(
+        [_menu_file, _menu_export, _menu_help, btn_new_gallery],
+        spacing=2,
+        visible=True,
+        wrap=True,
+    )
+
+    _tile_title_style = ft.TextStyle(size=13, weight=ft.FontWeight.W_500)
+
+    exif_toolbar_inner = ft.Container(
+        visible=True,
+        padding=ft.Padding.symmetric(horizontal=0, vertical=2),
+        content=ft.Column(
+            tight=True,
+            spacing=2,
+            controls=[
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Container(
+                            expand=True,
+                            padding=ft.Padding.only(right=4),
+                            content=status,
+                        ),
+                        ft.Row(
+                            spacing=6,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            controls=[
+                                ft.Container(
+                                    width=1,
+                                    height=18,
+                                    bgcolor=ft.Colors.with_opacity(
+                                        0.2, ft.Colors.BLACK
+                                    ),
+                                ),
+                                show_thumbs,
+                            ],
+                        ),
+                    ],
+                ),
+                ft.ExpansionTile(
+                    expanded=False,
+                    dense=True,
+                    tile_padding=ft.Padding.symmetric(horizontal=4, vertical=0),
+                    controls_padding=ft.Padding.only(left=8, right=4, bottom=6),
+                    title=ft.Text(
+                        tr("expansion_toggles"),
+                        style=_tile_title_style,
+                    ),
+                    controls=[
+                        ft.Column(
+                            tight=True,
+                            spacing=0,
+                            controls=[
+                                exif_show_strip,
+                                exif_sw_soft,
+                                exif_sw_date,
+                                exif_sw_mode,
+                                ft.Row(
+                                    alignment=ft.MainAxisAlignment.END,
+                                    controls=[
+                                        ft.IconButton(
+                                            icon=ft.Icons.VERTICAL_ALIGN_BOTTOM,
+                                            tooltip=tr("tooltip_reset_strip"),
+                                            on_click=reset_exif_strip_pos,
+                                            icon_size=18,
+                                            style=ft.ButtonStyle(padding=2),
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                ft.ExpansionTile(
+                    expanded=False,
+                    dense=True,
+                    tile_padding=ft.Padding.symmetric(horizontal=4, vertical=0),
+                    controls_padding=ft.Padding.only(left=8, right=4, bottom=6),
+                    title=ft.Text(
+                        tr("expansion_placement"),
+                        style=_tile_title_style,
+                    ),
+                    controls=[dd_exif_placement],
+                ),
+                ft.ExpansionTile(
+                    expanded=False,
+                    dense=True,
+                    tile_padding=ft.Padding.symmetric(horizontal=4, vertical=0),
+                    controls_padding=ft.Padding.only(left=8, right=4, bottom=6),
+                    title=ft.Text(
+                        tr("expansion_opacity"),
+                        style=_tile_title_style,
+                    ),
+                    controls=[
+                        ft.Column(
+                            tight=True,
+                            spacing=4,
+                            controls=[
+                                ft.Text(
+                                    tr("label_opacity_colon"),
+                                    size=11,
+                                    opacity=0.72,
+                                ),
+                                exif_opacity_slider,
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    thumb_block = ft.Container(
+        visible=True,
+        content=thumb_strip,
+    )
+
+    sidebar_toggle_btn = ft.IconButton(
+        icon=ft.Icons.CHEVRON_LEFT,
+        tooltip=tr("tooltip_sidebar_close"),
+        icon_size=22,
+        style=ft.ButtonStyle(padding=4),
+    )
+
+    left_sidebar = ft.Container(
+        width=SIDEBAR_W_EXPANDED,
+        bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+        border=ft.Border.only(
+            right=ft.BorderSide(
+                1, ft.Colors.with_opacity(0.12, ft.Colors.BLACK)
+            )
+        ),
+        padding=ft.Padding.symmetric(horizontal=2, vertical=4),
+        content=ft.Column(
+            expand=True,
+            spacing=0,
+            tight=True,
+            controls=[
+                ft.Row(
+                    [sidebar_toggle_btn, menus_row],
+                    spacing=0,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Container(
+                    expand=True,
+                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                    content=ft.Column(
+                        scroll=ft.ScrollMode.AUTO,
+                        expand=True,
+                        spacing=6,
+                        tight=True,
+                        controls=[
+                            exif_toolbar_inner,
+                            thumb_block,
+                        ],
+                    ),
+                ),
+            ],
+        ),
+    )
+
+    def toggle_sidebar(_: ft.ControlEvent) -> None:
+        sidebar_open[0] = not sidebar_open[0]
+        o = sidebar_open[0]
+        left_sidebar.width = SIDEBAR_W_EXPANDED if o else SIDEBAR_W_COLLAPSED
+        menus_row.visible = o
+        exif_toolbar_inner.visible = o
+        thumb_block.visible = o and bool(show_thumbs.value)
+        sidebar_toggle_btn.icon = (
+            ft.Icons.CHEVRON_LEFT if o else ft.Icons.CHEVRON_RIGHT
+        )
+        sidebar_toggle_btn.tooltip = (
+            tr("tooltip_sidebar_close") if o else tr("tooltip_sidebar_open")
+        )
+        _apply_exif_strip_positions()
+        page.update()
+
+    sidebar_toggle_btn.on_click = toggle_sidebar
+
+    def on_toggle_thumbs(_: ft.ControlEvent) -> None:
+        thumb_strip.visible = show_thumbs.value
+        thumb_block.visible = sidebar_open[0] and bool(show_thumbs.value)
+        page.update()
+
+    show_thumbs.on_change = on_toggle_thumbs
 
     def on_page_resize(_: ft.PageResizeEvent) -> None:
         _apply_exif_strip_positions()
@@ -3687,64 +4132,27 @@ def main(page: ft.Page) -> None:
     page.add(
         ft.SafeArea(
             expand=True,
-            content=ft.Column(
+            content=ft.Row(
                 expand=True,
                 spacing=0,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
                 controls=[
+                    left_sidebar,
                     ft.Container(
-                        padding=ft.Padding.symmetric(horizontal=16, vertical=8),
-                        content=ft.Column(
-                            tight=True,
-                            spacing=6,
+                        expand=True,
+                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                        bgcolor=ft.Colors.BLACK,
+                        content=ft.Row(
+                            expand=True,
+                            spacing=4,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             controls=[
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    controls=[
-                                        status,
-                                        show_thumbs,
-                                    ],
-                                ),
-                                ft.Row(
-                                    scroll=ft.ScrollMode.AUTO,
-                                    spacing=12,
-                                    controls=[
-                                        exif_show_strip,
-                                        exif_sw_soft,
-                                        exif_sw_date,
-                                        exif_sw_mode,
-                                        ft.IconButton(
-                                            icon=ft.Icons.VERTICAL_ALIGN_BOTTOM,
-                                            tooltip=tr("tooltip_reset_strip"),
-                                            on_click=reset_exif_strip_pos,
-                                            icon_size=20,
-                                            style=ft.ButtonStyle(padding=4),
-                                        ),
-                                    ],
-                                ),
-                                ft.Row(
-                                    scroll=ft.ScrollMode.AUTO,
-                                    spacing=16,
-                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                    controls=[
-                                        dd_exif_placement,
-                                        ft.Text(tr("label_opacity_colon"), size=12, opacity=0.85),
-                                        exif_opacity_slider,
-                                    ],
-                                ),
+                                btn_prev,
+                                ft.Container(expand=True, content=page_view),
+                                btn_next,
                             ],
                         ),
                     ),
-                    ft.Row(
-                        expand=True,
-                        spacing=4,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            btn_prev,
-                            ft.Container(expand=True, content=page_view),
-                            btn_next,
-                        ],
-                    ),
-                    thumb_strip,
                 ],
             ),
         )
