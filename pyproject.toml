@@ -9,6 +9,7 @@ dependencies = []
 [tool.flet]
 product = "Ed Image Preview"
 artifact = "Ed Image Preview"
+copyright = "Copyright (c) 2026 Edimar Barbosa. All rights reserved."
 # Não empacotar a venv nem artefactos de build — só o código e assets.
 # Sem isto, o zip inclui .venv inteiro e o .app pode parecer «antigo» ou enorme.
 app.exclude = [

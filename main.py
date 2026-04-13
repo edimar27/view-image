@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ import flet as ft
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
+from i18n import init_app_i18n, tr
 
 IMAGE_EXTENSIONS = frozenset(
     ".jpg .jpeg .png .gif .webp .bmp .tiff .tif .heic .heif".split()
@@ -86,6 +89,176 @@ def _ratio_to_float(val: object) -> float | None:
     if isinstance(val, (int, float)):
         return float(val)
     return None
+
+
+_EXIF_DIAL_TOKEN_RE = re.compile(r"\b([UC][123])\b", re.IGNORECASE)
+
+# CIPA ExposureProgram (Exif.Photo.ExposureProgram): códigos de modo de disparo.
+_EXPOSURE_PROGRAM_PSAM: dict[int, str] = {
+    1: "M",
+    2: "P",
+    3: "A",
+    4: "S",
+    5: "P+",
+    6: "P*",
+    7: "Portrait",
+    8: "Landscape",
+}
+
+_SCENE_CAPTURE_LABEL: dict[int, str] = {
+    0: "Standard",
+    1: "Landscape",
+    2: "Portrait",
+    3: "Night",
+    4: "Night portrait",
+}
+
+
+def _exif_int_scalar(val: object) -> int | None:
+    """Inteiro EXIF (IFDRational, tuplo, str dígitos)."""
+    if val is None or isinstance(val, bool):
+        return None
+    r = _ratio_to_float(val)
+    if r is not None:
+        try:
+            ir = int(round(r))
+            if abs(r - float(ir)) < 1e-5:
+                return ir
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if isinstance(val, int):
+        return val
+    if isinstance(val, tuple) and val:
+        return _exif_int_scalar(val[0])
+    if isinstance(val, (bytes, memoryview)):
+        return None
+    s = str(val).strip()
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _psam_from_exposure_program_text(s: str) -> str | None:
+    sl = s.lower().replace("_", " ")
+    if "manual" in sl or sl.strip() in ("m", "manual control"):
+        return "M"
+    if "bulb" in sl:
+        return "B"
+    if "aperture" in sl or " av" in sl or sl.strip() in ("av", "a"):
+        return "A"
+    if "shutter" in sl or "time priority" in sl or sl.strip() in ("tv", "s"):
+        return "S"
+    if "program ae" in sl or "normal program" in sl or sl == "program":
+        return "P"
+    if "creative" in sl and "action" not in sl:
+        return "P+"
+    if "action" in sl or "sports" in sl:
+        return "P*"
+    if "portrait" in sl:
+        return "Portrait"
+    if "landscape" in sl:
+        return "Landscape"
+    return None
+
+
+def _psam_from_exposure_program_value(val: object) -> str | None:
+    n = _exif_int_scalar(val)
+    if n is not None and n > 0:
+        short = _EXPOSURE_PROGRAM_PSAM.get(n)
+        if short:
+            return short
+    if val is None:
+        return None
+    s = _exif_tag_string(val)
+    if s:
+        return _psam_from_exposure_program_text(s)
+    return None
+
+
+def _extract_dial_tokens_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _EXIF_DIAL_TOKEN_RE.finditer(text):
+        tok = m.group(1).upper()
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def _scan_merged_for_dial_tokens(merged: dict[str, object]) -> list[str]:
+    """U1/U2/U3/C1/C2/C3 em comentários ou Makernote legível (ex. Canon)."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for key in ("UserComment", "ImageDescription", "Artist"):
+        t = _exif_tag_string(merged.get(key, ""))
+        for tok in _extract_dial_tokens_from_text(t):
+            if tok not in seen:
+                seen.add(tok)
+                found.append(tok)
+    for key, val in merged.items():
+        if not key.startswith("Maker_"):
+            continue
+        s = _exif_value_short(val, 120)
+        if not s or s.startswith("<binário"):
+            continue
+        for tok in _extract_dial_tokens_from_text(s):
+            if tok not in seen:
+                seen.add(tok)
+                found.append(tok)
+    return found
+
+
+def _scene_capture_label(val: object) -> str | None:
+    n = _exif_int_scalar(val)
+    if n is not None:
+        lab = _SCENE_CAPTURE_LABEL.get(n)
+        if lab and lab != "Standard":
+            return lab
+        return None
+    s = _exif_tag_string(val)
+    if not s:
+        return None
+    sl = s.lower()
+    if sl in ("standard", "0"):
+        return None
+    return _exif_value_short(val, 24)
+
+
+def _capture_mode_description(merged: dict[str, object]) -> str | None:
+    """Resumo de modo de captura: dial U/C + PSAM (M, A, …) + cena / bracketing."""
+    parts: list[str] = []
+    for tok in _scan_merged_for_dial_tokens(merged):
+        parts.append(tok)
+    psam = _psam_from_exposure_program_value(merged.get("ExposureProgram"))
+    if psam:
+        parts.append(psam)
+    else:
+        ep = merged.get("ExposureProgram")
+        if ep is not None and str(ep).strip():
+            raw = _exif_value_short(ep, 40)
+            if raw:
+                parts.append(raw)
+    em = _exif_int_scalar(merged.get("ExposureMode"))
+    if em == 2:
+        parts.append("AEB")
+    sct = _scene_capture_label(merged.get("SceneCaptureType"))
+    if sct and (not psam or sct.lower() != psam.lower()) and sct not in parts:
+        parts.append(sct)
+    if not parts:
+        return None
+    dedup: list[str] = []
+    seen2: set[str] = set()
+    for p in parts:
+        if p not in seen2:
+            seen2.add(p)
+            dedup.append(p)
+    return " · ".join(dedup)
 
 
 def _format_exposure_seconds(val: object) -> str | None:
@@ -181,6 +354,7 @@ _PHOTO_EXIF_ANY_OF = frozenset(
         "SubjectDistance",
         "Flash",
         "ExposureProgram",
+        "ExposureMode",
         "MeteringMode",
         "WhiteBalance",
         "SceneCaptureType",
@@ -213,6 +387,14 @@ def _append_pillow_exif_to_merged(exif: object, merged: dict[str, object]) -> No
 
     merge_ifd(IFD.Exif)
     merge_ifd(IFD.GPSInfo, "GPS.")
+    try:
+        mk = exif.get_ifd(IFD.Makernote)
+    except (KeyError, ValueError, TypeError):
+        mk = {}
+    for mk_k, mk_v in mk.items():
+        if isinstance(mk_v, bytes) and len(mk_v) > 512:
+            continue
+        merged[f"Maker_{mk_k:04X}"] = mk_v
     for k in exif:
         if k in (IFD.Exif, IFD.GPSInfo):
             continue
@@ -828,15 +1010,9 @@ def _build_exif_overlay_pairs_from_merged(
         rows.append(("Flash", str(flash)))
 
     if xf.show_mode:
-        mode_parts: list[str] = []
-        ep = merged.get("ExposureProgram")
-        if ep is not None and str(ep).strip():
-            mode_parts.append(str(ep))
-        sct = merged.get("SceneCaptureType")
-        if sct is not None and str(sct).strip():
-            mode_parts.append(_exif_value_short(sct, 48))
-        if mode_parts:
-            rows.append(("Mode", " · ".join(mode_parts)))
+        mode_line = _capture_mode_description(merged)
+        if mode_line:
+            rows.append(("Mode", mode_line))
 
     mm = merged.get("MeteringMode")
     if mm is not None and str(mm).strip():
@@ -886,7 +1062,7 @@ def _build_exif_overlay_pairs_from_merged(
 def _build_exif_overlay_pairs(path: Path | str) -> list[tuple[str, str]]:
     merged = _load_merged_exif_from_path(path)
     if merged is None:
-        return [("EXIF", "Ficheiro inacessível")]
+        return [("EXIF", tr("exif_file_inaccessible"))]
     return _build_exif_overlay_pairs_from_merged(merged)
 
 
@@ -2153,6 +2329,10 @@ def format_exif_footer(path: Path | str) -> str:
     if iso is not None and str(iso).strip():
         main.append(f"ISO: {iso}")
 
+    cap = _capture_mode_description(merged)
+    if cap:
+        main.append(f"Mode: {cap}")
+
     extras: list[str] = []
     dt = merged.get("DateTimeOriginal") or merged.get("DateTime")
     if dt:
@@ -2297,6 +2477,7 @@ def _image_paths_from_argv() -> list[Path]:
 
 
 def main(page: ft.Page) -> None:
+    init_app_i18n()
     page.title = "Ed Image Preview"
     page.theme_mode = ft.ThemeMode.SYSTEM
     page.padding = 0
@@ -2326,11 +2507,11 @@ def main(page: ft.Page) -> None:
     _file_picker_keepalive: list[ft.FilePicker] = []
 
     status = ft.Text(
-        "Adicione pastas ou ficheiros (imagens); use limpar para recomeçar.",
+        tr("status_add_hint"),
         size=13,
         opacity=0.8,
     )
-    show_thumbs = ft.Switch(label="Miniaturas", value=True)
+    show_thumbs = ft.Switch(label=tr("label_thumbnails"), value=True)
 
     page_view = ft.PageView(
         expand=True,
@@ -2368,15 +2549,14 @@ def main(page: ft.Page) -> None:
                     spacing=8,
                     controls=[
                         ft.Text(
-                            "Miniaturas — toque na foto para o slide; ícone à direita "
-                            "marca para guardar várias com tarja.",
+                            tr("thumb_strip_hint"),
                             size=12,
                             weight=ft.FontWeight.W_500,
                             opacity=0.7,
                             expand=True,
                         ),
                         ft.TextButton(
-                            "Limpar marcações",
+                            tr("btn_clear_marks"),
                             on_click=clear_thumb_selection,
                         ),
                     ],
@@ -2394,12 +2574,12 @@ def main(page: ft.Page) -> None:
 
     btn_prev = ft.IconButton(
         icon=ft.Icons.CHEVRON_LEFT,
-        tooltip="Anterior (← ou seta esquerda)",
+        tooltip=tr("tooltip_prev"),
         disabled=True,
     )
     btn_next = ft.IconButton(
         icon=ft.Icons.CHEVRON_RIGHT,
-        tooltip="Seguinte (→ ou seta direita)",
+        tooltip=tr("tooltip_next"),
         disabled=True,
     )
 
@@ -2464,10 +2644,10 @@ def main(page: ft.Page) -> None:
     exif_strip_opacity: float = 0.58
     exif_strip_placement: str = "auto"
 
-    exif_sw_soft = ft.Switch(label="Software", value=True)
-    exif_sw_date = ft.Switch(label="Data capt.", value=True)
-    exif_sw_mode = ft.Switch(label="Mode", value=True)
-    exif_show_strip = ft.Switch(label="Tarja EXIF", value=True)
+    exif_sw_soft = ft.Switch(label=tr("label_software"), value=True)
+    exif_sw_date = ft.Switch(label=tr("label_capture_date"), value=True)
+    exif_sw_mode = ft.Switch(label=tr("label_mode"), value=True)
+    exif_show_strip = ft.Switch(label=tr("label_exif_strip"), value=True)
 
     def _get_exif_filter() -> ExifDisplayFilter:
         return ExifDisplayFilter(
@@ -2772,22 +2952,22 @@ def main(page: ft.Page) -> None:
         width=360,
         dense=True,
         value="auto",
-        label="Disposição da tarja",
+        label=tr("strip_placement_label"),
         options=[
-            ft.DropdownOption(key="auto", text="Automático (formato da foto)"),
-            ft.DropdownOption(key="h_bottom", text="Horizontal — fundo (centro)"),
-            ft.DropdownOption(key="h_bottom_left", text="Horizontal — fundo esquerdo"),
-            ft.DropdownOption(key="h_bottom_right", text="Horizontal — fundo direito"),
-            ft.DropdownOption(key="h_top", text="Horizontal — topo (centro)"),
-            ft.DropdownOption(key="h_top_left", text="Horizontal — topo esquerdo"),
-            ft.DropdownOption(key="h_top_right", text="Horizontal — topo direito"),
-            ft.DropdownOption(key="h_center", text="Horizontal — meio"),
-            ft.DropdownOption(key="v_left", text="Vertical — esquerda (centro)"),
-            ft.DropdownOption(key="v_left_bottom", text="Vertical — esquerda inferior"),
-            ft.DropdownOption(key="v_left_top", text="Vertical — esquerda superior"),
-            ft.DropdownOption(key="v_right", text="Vertical — direita (centro)"),
-            ft.DropdownOption(key="v_right_bottom", text="Vertical — direita inferior"),
-            ft.DropdownOption(key="v_right_top", text="Vertical — direita superior"),
+            ft.DropdownOption(key="auto", text=tr("pl_auto")),
+            ft.DropdownOption(key="h_bottom", text=tr("pl_h_bottom")),
+            ft.DropdownOption(key="h_bottom_left", text=tr("pl_h_bottom_left")),
+            ft.DropdownOption(key="h_bottom_right", text=tr("pl_h_bottom_right")),
+            ft.DropdownOption(key="h_top", text=tr("pl_h_top")),
+            ft.DropdownOption(key="h_top_left", text=tr("pl_h_top_left")),
+            ft.DropdownOption(key="h_top_right", text=tr("pl_h_top_right")),
+            ft.DropdownOption(key="h_center", text=tr("pl_h_center")),
+            ft.DropdownOption(key="v_left", text=tr("pl_v_left")),
+            ft.DropdownOption(key="v_left_bottom", text=tr("pl_v_left_bottom")),
+            ft.DropdownOption(key="v_left_top", text=tr("pl_v_left_top")),
+            ft.DropdownOption(key="v_right", text=tr("pl_v_right")),
+            ft.DropdownOption(key="v_right_bottom", text=tr("pl_v_right_bottom")),
+            ft.DropdownOption(key="v_right_top", text=tr("pl_v_right_top")),
         ],
         on_select=on_exif_placement_changed,
     )
@@ -2797,7 +2977,7 @@ def main(page: ft.Page) -> None:
         max=1.0,
         value=0.58,
         divisions=18,
-        label="Opacidade",
+        label=tr("label_opacity"),
         width=240,
         on_change=on_exif_opacity_changed,
     )
@@ -2847,12 +3027,12 @@ def main(page: ft.Page) -> None:
                 except OSError:
                     pass
             _picker_temp_paths.clear()
-            status.value = "Nenhuma imagem encontrada."
+            status.value = tr("status_no_images")
             sync_nav_buttons()
             page.update()
             return
 
-        status.value = f"{len(paths)} imagem(ns)"
+        status.value = tr("status_n_images", n=len(paths))
 
         for i, src in enumerate(paths):
             src_str = str(src)
@@ -2860,7 +3040,7 @@ def main(page: ft.Page) -> None:
             merged_slide = _load_merged_exif_from_path(src_str)
             if merged_slide is None:
                 m_for_pairs: dict[str, object] = {}
-                exif_pairs_slide = [("EXIF", "Ficheiro inacessível")]
+                exif_pairs_slide = [("EXIF", tr("exif_file_inaccessible"))]
                 merged_for_logo: dict[str, object] = {}
             else:
                 m_for_pairs = merged_slide
@@ -2946,10 +3126,7 @@ def main(page: ft.Page) -> None:
                 ],
                 content=exif_overlay_slide,
                 visible=exif_show_strip.value,
-                tooltip=(
-                    "Arraste para mover; canto inferior direito para largura. "
-                    "Opacidade e disposição (horizontal/vertical) afetam também a exportação."
-                ),
+                tooltip=tr("exif_drag_tooltip"),
             )
             exif_move_gd = ft.GestureDetector(
                 mouse_cursor=ft.MouseCursor.GRAB,
@@ -2977,7 +3154,7 @@ def main(page: ft.Page) -> None:
                         content=ft.IconButton(
                             icon=ft.Icons.CLOSE,
                             icon_size=18,
-                            tooltip="Ocultar tarja (ligue «Tarja EXIF» para voltar a mostrar)",
+                            tooltip=tr("tooltip_hide_strip"),
                             style=ft.ButtonStyle(padding=2),
                             on_click=on_exif_strip_close_click,
                         ),
@@ -3017,7 +3194,7 @@ def main(page: ft.Page) -> None:
             sel_btn = ft.IconButton(
                 icon=ft.Icons.CHECK_BOX_OUTLINE_BLANK,
                 icon_size=18,
-                tooltip="Marcar / desmarcar para guardar com tarja (várias)",
+                tooltip=tr("tooltip_thumb_mark"),
                 style=ft.ButtonStyle(padding=2),
                 on_click=lambda e, ix=i: toggle_thumb_mark(e, ix),
             )
@@ -3125,7 +3302,7 @@ def main(page: ft.Page) -> None:
     async def _save_current_with_strip_async() -> None:
         if page.web:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Guardar com tarja só no ambiente de trabalho (não no modo web).")
+                content=ft.Text(tr("snack_web_save"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3137,7 +3314,7 @@ def main(page: ft.Page) -> None:
         merged = slide_merges[idx] if idx < len(slide_merges) else {}
         if _load_merged_exif_from_path(path) is None:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Ficheiro inacessível; não é possível guardar.")
+                content=ft.Text(tr("snack_file_inaccessible_save"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3146,7 +3323,7 @@ def main(page: ft.Page) -> None:
             from PIL import Image  # noqa: F401
         except ImportError:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Instale Pillow (requirements.txt) para guardar com tarja.")
+                content=ft.Text(tr("snack_install_pillow"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3157,7 +3334,7 @@ def main(page: ft.Page) -> None:
         await asyncio.sleep(0.12)
         try:
             dest = await file_picker.save_file(
-                dialog_title="Guardar imagem com tarja EXIF",
+                dialog_title=tr("dialog_save_exif"),
                 file_name=default_name,
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=[
@@ -3174,7 +3351,7 @@ def main(page: ft.Page) -> None:
             )
         except Exception as ex:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(f"Erro ao abrir o diálogo: {ex}")
+                content=ft.Text(tr("snack_dialog_error", ex=ex))
             )
             page.snack_bar.open = True
             page.update()
@@ -3194,13 +3371,13 @@ def main(page: ft.Page) -> None:
             else:
                 im.save(str(dest_path), quality=92)
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(f"Guardado: {dest_path.name}")
+                content=ft.Text(tr("snack_saved", name=dest_path.name))
             )
             page.snack_bar.open = True
             page.update()
         except Exception as ex:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(f"Erro ao guardar: {ex}")
+                content=ft.Text(tr("snack_save_error", ex=ex))
             )
             page.snack_bar.open = True
             page.update()
@@ -3208,7 +3385,7 @@ def main(page: ft.Page) -> None:
     async def _save_all_with_strip_async() -> None:
         if page.web:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Guardar com tarja só no ambiente de trabalho (não no modo web).")
+                content=ft.Text(tr("snack_web_save"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3219,7 +3396,7 @@ def main(page: ft.Page) -> None:
             from PIL import Image  # noqa: F401
         except ImportError:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Instale Pillow (requirements.txt) para guardar com tarja.")
+                content=ft.Text(tr("snack_install_pillow"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3227,11 +3404,11 @@ def main(page: ft.Page) -> None:
         await asyncio.sleep(0.12)
         try:
             folder = await file_picker.get_directory_path(
-                dialog_title="Pasta onde guardar cópias com tarja EXIF"
+                dialog_title=tr("dialog_folder_copies")
             )
         except Exception as ex:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(f"Erro ao escolher pasta: {ex}")
+                content=ft.Text(tr("snack_folder_error", ex=ex))
             )
             page.snack_bar.open = True
             page.update()
@@ -3263,7 +3440,7 @@ def main(page: ft.Page) -> None:
             except Exception:
                 continue
         page.snack_bar = ft.SnackBar(
-            content=ft.Text(f"Guardadas {n_ok} imagem(ns) em {folder}")
+            content=ft.Text(tr("snack_saved_n", n=n_ok, folder=folder))
         )
         page.snack_bar.open = True
         page.update()
@@ -3271,16 +3448,14 @@ def main(page: ft.Page) -> None:
     async def _save_selected_with_strip_async() -> None:
         if page.web:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Guardar com tarja só no ambiente de trabalho (não no modo web).")
+                content=ft.Text(tr("snack_web_save"))
             )
             page.snack_bar.open = True
             page.update()
             return
         if not thumb_selected:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(
-                    "Marque miniaturas com o ícone da caixa (canto superior direito)."
-                )
+                content=ft.Text(tr("snack_mark_thumbnails"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3289,7 +3464,7 @@ def main(page: ft.Page) -> None:
             from PIL import Image  # noqa: F401
         except ImportError:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Instale Pillow (requirements.txt) para guardar com tarja.")
+                content=ft.Text(tr("snack_install_pillow"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3297,11 +3472,11 @@ def main(page: ft.Page) -> None:
         await asyncio.sleep(0.12)
         try:
             folder = await file_picker.get_directory_path(
-                dialog_title="Pasta onde guardar as miniaturas marcadas com tarja EXIF"
+                dialog_title=tr("dialog_folder_marked")
             )
         except Exception as ex:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(f"Erro ao escolher pasta: {ex}")
+                content=ft.Text(tr("snack_folder_error", ex=ex))
             )
             page.snack_bar.open = True
             page.update()
@@ -3338,7 +3513,14 @@ def main(page: ft.Page) -> None:
             except Exception:
                 continue
         page.snack_bar = ft.SnackBar(
-            content=ft.Text(f"Guardadas {n_ok} de {len(thumb_selected)} marcada(s) em {folder}")
+            content=ft.Text(
+                tr(
+                    "snack_saved_n_marked",
+                    n=n_ok,
+                    total=len(thumb_selected),
+                    folder=folder,
+                )
+            )
         )
         page.snack_bar.open = True
         page.update()
@@ -3346,7 +3528,7 @@ def main(page: ft.Page) -> None:
     async def _open_folder_async() -> None:
         if page.web:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("No modo web, use «Selecionar imagens».")
+                content=ft.Text(tr("snack_web_use_select"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3355,17 +3537,14 @@ def main(page: ft.Page) -> None:
         await asyncio.sleep(0.15)
         try:
             path = await file_picker.get_directory_path(
-                dialog_title="Pasta com imagens"
+                dialog_title=tr("dialog_folder_images")
             )
         except Exception as ex:
             if "session closed" in str(ex).lower():
                 return
             if "timeout" in str(ex).lower():
                 page.snack_bar = ft.SnackBar(
-                    content=ft.Text(
-                        "Tempo esgotado ao abrir a pasta. Tente de novo ou use "
-                        "«Selecionar imagens»."
-                    )
+                    content=ft.Text(tr("snack_timeout_folder"))
                 )
                 page.snack_bar.open = True
                 page.update()
@@ -3376,7 +3555,7 @@ def main(page: ft.Page) -> None:
         imgs = collect_images_from_dir(Path(path))
         if not imgs:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text("Nenhuma imagem nessa pasta.")
+                content=ft.Text(tr("snack_no_images_folder"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3390,7 +3569,7 @@ def main(page: ft.Page) -> None:
             # IMAGE costuma ser mais fiável que CUSTOM em iOS/macOS.
             # with_data=True garante bytes quando a plataforma não devolve `path`.
             files = await file_picker.pick_files(
-                dialog_title="Selecionar imagens",
+                dialog_title=tr("dialog_pick_images"),
                 allow_multiple=True,
                 file_type=ft.FilePickerFileType.IMAGE,
                 with_data=True,
@@ -3400,10 +3579,7 @@ def main(page: ft.Page) -> None:
                 return
             if "timeout" in str(ex).lower():
                 page.snack_bar = ft.SnackBar(
-                    content=ft.Text(
-                        "Tempo esgotado ao abrir o seletor. Atualize o Flet, "
-                        "reinicie a app ou tente outra vez."
-                    )
+                    content=ft.Text(tr("snack_timeout_picker"))
                 )
                 page.snack_bar.open = True
                 page.update()
@@ -3419,7 +3595,7 @@ def main(page: ft.Page) -> None:
                 continue
             raw = getattr(f, "bytes", None)
             if raw:
-                name = getattr(f, "name", "") or "imagem"
+                name = getattr(f, "name", "") or tr("picker_default_name")
                 sfx = (Path(str(name)).suffix or ".jpg").lower()
                 if sfx not in IMAGE_EXTENSIONS:
                     sfx = ".jpg"
@@ -3432,10 +3608,7 @@ def main(page: ft.Page) -> None:
                 _picker_temp_paths.append(tmp_path)
         if not paths:
             page.snack_bar = ft.SnackBar(
-                content=ft.Text(
-                    "Não foi possível ler os ficheiros (sem caminho nem dados). "
-                    "Tente «Adicionar pasta» ou atualize o Flet."
-                )
+                content=ft.Text(tr("snack_files_unreadable"))
             )
             page.snack_bar.open = True
             page.update()
@@ -3470,35 +3643,35 @@ def main(page: ft.Page) -> None:
         actions=[
             ft.IconButton(
                 icon=ft.Icons.FOLDER_OPEN,
-                tooltip="Adicionar pasta à galeria (várias pastas permitidas)",
+                tooltip=tr("tooltip_add_folder"),
                 on_click=pick_folder_click,
                 disabled=page.web,
             ),
             ft.IconButton(
                 icon=ft.Icons.COLLECTIONS,
-                tooltip="Adicionar imagens à galeria",
+                tooltip=tr("tooltip_add_images"),
                 on_click=pick_files_click,
             ),
             ft.IconButton(
                 icon=ft.Icons.DELETE_OUTLINE,
-                tooltip="Limpar galeria",
+                tooltip=tr("tooltip_clear"),
                 on_click=clear_gallery_click,
             ),
             ft.IconButton(
                 icon=ft.Icons.SAVE_AS,
-                tooltip="Guardar o slide atual com tarja EXIF (como no ecrã)…",
+                tooltip=tr("tooltip_save_current"),
                 on_click=lambda _: page.run_task(_save_current_with_strip_async),
                 disabled=page.web,
             ),
             ft.IconButton(
                 icon=ft.Icons.LIBRARY_ADD_CHECK,
-                tooltip="Guardar só as miniaturas marcadas (caixa) com tarja numa pasta…",
+                tooltip=tr("tooltip_save_marked"),
                 on_click=lambda _: page.run_task(_save_selected_with_strip_async),
                 disabled=page.web,
             ),
             ft.IconButton(
                 icon=ft.Icons.FOLDER_SPECIAL,
-                tooltip="Guardar toda a galeria com tarja numa pasta (ignora marcações)…",
+                tooltip=tr("tooltip_save_all"),
                 on_click=lambda _: page.run_task(_save_all_with_strip_async),
                 disabled=page.web,
             ),
@@ -3541,7 +3714,7 @@ def main(page: ft.Page) -> None:
                                         exif_sw_mode,
                                         ft.IconButton(
                                             icon=ft.Icons.VERTICAL_ALIGN_BOTTOM,
-                                            tooltip="Repor posição da tarja (consoante a disposição escolhida)",
+                                            tooltip=tr("tooltip_reset_strip"),
                                             on_click=reset_exif_strip_pos,
                                             icon_size=20,
                                             style=ft.ButtonStyle(padding=4),
@@ -3554,7 +3727,7 @@ def main(page: ft.Page) -> None:
                                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                                     controls=[
                                         dd_exif_placement,
-                                        ft.Text("Opacidade:", size=12, opacity=0.85),
+                                        ft.Text(tr("label_opacity_colon"), size=12, opacity=0.85),
                                         exif_opacity_slider,
                                     ],
                                 ),
