@@ -2561,14 +2561,11 @@ def main(page: ft.Page) -> None:
         opacity=0.8,
     )
     _sw_compact = {
-        "label_text_style": ft.TextStyle(size=11),
         "padding": ft.Padding.symmetric(horizontal=0, vertical=0),
+        "scale": 0.72,
+        "splash_radius": 8,
     }
-    show_thumbs = ft.Switch(
-        label=tr("label_thumbnails"),
-        value=True,
-        **_sw_compact,
-    )
+    show_thumbs = ft.Switch(value=True, **_sw_compact)
 
     # Painel esquerdo retrátil: menu + EXIF + miniaturas (área direita só para a foto).
     sidebar_open: list[bool] = [True]
@@ -2753,10 +2750,27 @@ def main(page: ft.Page) -> None:
     exif_strip_opacity: float = 0.58
     exif_strip_placement: str = "auto"
 
-    exif_sw_soft = ft.Switch(label=tr("label_software"), value=True, **_sw_compact)
-    exif_sw_date = ft.Switch(label=tr("label_capture_date"), value=True, **_sw_compact)
-    exif_sw_mode = ft.Switch(label=tr("label_mode"), value=True, **_sw_compact)
-    exif_show_strip = ft.Switch(label=tr("label_exif_strip"), value=True, **_sw_compact)
+    exif_sw_soft = ft.Switch(value=True, **_sw_compact)
+    exif_sw_date = ft.Switch(value=True, **_sw_compact)
+    exif_sw_mode = ft.Switch(value=True, **_sw_compact)
+    exif_show_strip = ft.Switch(value=True, **_sw_compact)
+
+    def _toggle_row(label: str, sw: ft.Switch) -> ft.Row:
+        return ft.Row(
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=8,
+            controls=[
+                ft.Text(
+                    label,
+                    size=10,
+                    expand=True,
+                    text_align=ft.TextAlign.START,
+                    opacity=0.92,
+                ),
+                sw,
+            ],
+        )
 
     def _get_exif_filter() -> ExifDisplayFilter:
         return ExifDisplayFilter(
@@ -3966,12 +3980,26 @@ def main(page: ft.Page) -> None:
                             controls=[
                                 ft.Container(
                                     width=1,
-                                    height=18,
+                                    height=16,
                                     bgcolor=ft.Colors.with_opacity(
                                         0.2, ft.Colors.BLACK
                                     ),
                                 ),
-                                show_thumbs,
+                                ft.Row(
+                                    expand=True,
+                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                    controls=[
+                                        ft.Text(
+                                            tr("label_thumbnails"),
+                                            size=10,
+                                            expand=True,
+                                            text_align=ft.TextAlign.START,
+                                            opacity=0.92,
+                                        ),
+                                        show_thumbs,
+                                    ],
+                                ),
                             ],
                         ),
                     ],
@@ -3988,12 +4016,12 @@ def main(page: ft.Page) -> None:
                     controls=[
                         ft.Column(
                             tight=True,
-                            spacing=0,
+                            spacing=2,
                             controls=[
-                                exif_show_strip,
-                                exif_sw_soft,
-                                exif_sw_date,
-                                exif_sw_mode,
+                                _toggle_row(tr("label_exif_strip"), exif_show_strip),
+                                _toggle_row(tr("label_software"), exif_sw_soft),
+                                _toggle_row(tr("label_capture_date"), exif_sw_date),
+                                _toggle_row(tr("label_mode"), exif_sw_mode),
                                 ft.Row(
                                     alignment=ft.MainAxisAlignment.END,
                                     controls=[
