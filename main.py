@@ -549,11 +549,18 @@ _ASSET_INSTAGRAM_GLYPH = Path(__file__).resolve().parent / "assets" / "social" /
 
 @dataclass
 class ExifDisplayFilter:
-    """Quais campos opcionais mostrar na tarja EXIF (ecrã e «Guardar como»)."""
+    """Quais campos mostrar na tarja EXIF (ecrã e exportação com tarja)."""
 
-    show_software: bool = True
+    show_camera_make: bool = True
+    show_camera_model: bool = True
+    show_aperture: bool = True
+    show_shutter_speed: bool = True
+    show_lens: bool = True
     show_date: bool = True
+    show_author: bool = True
+    show_iso: bool = True
     show_mode: bool = True
+    show_other_exif: bool = True
 
 
 # Largura da tarja em % da imagem / área do slide; posição 0..1 (nx, ny) = canto sup. esq.
@@ -782,6 +789,7 @@ def _export_map_strip_norms_to_image(
     placement: str,
     strip_w_pil: int,
     bar_h_pil: int,
+    pairs: list[tuple[str, str]],
     *,
     strip_width_frac: float = EXIF_STRIP_WIDTH_FRAC,
     strip_v_w_scale: float = 1.0,
@@ -795,7 +803,7 @@ def _export_map_strip_norms_to_image(
     ox, oy, dw, dh, _ = _letterbox_contain(iw, ih, pw, ph)
     if dw < 2 or dh < 2:
         return nx_ui, ny_ui
-    left, top, sw_v, sh_v = _viewport_exif_strip_rect(
+    left, top, sw_v, _sh_tpl = _viewport_exif_strip_rect(
         nx_ui,
         ny_ui,
         pw,
@@ -805,8 +813,21 @@ def _export_map_strip_norms_to_image(
         width_frac=strip_width_frac,
         v_strip_width_scale=strip_v_w_scale,
     )
+    sh_vp = _viewport_exif_strip_height_ui(ek, pairs, ph)
+    nxf = max(0.0, min(1.0, float(nx_ui)))
+    nyf = max(0.0, min(1.0, float(ny_ui)))
+    left = nxf * max(0.0, pw - sw_v)
+    if (
+        not ek.startswith("v_")
+        and iw > 0
+        and ih > 0
+    ):
+        free_y = _viewport_exif_strip_free_y(iw, ih, pw, ph, ek, sh_vp)
+        top = nyf * free_y
+    else:
+        top = nyf * max(0.0, ph - sh_vp)
     cx_v = left + sw_v / 2.0
-    cy_v = top + sh_v / 2.0
+    cy_v = top + sh_vp / 2.0
     u = (cx_v - ox) / dw
     v = (cy_v - oy) / dh
     u = max(0.0, min(1.0, u))
@@ -843,6 +864,18 @@ def _viewport_strip_intrinsic_height(
     return float(min(max(est, float(EXIF_VIEW_H_HORIZ)), ph_f - 2.0))
 
 
+def _viewport_exif_strip_height_ui(
+    ek: str, pairs: list[tuple[str, str]], ph_f: float
+) -> float:
+    """Altura da tarja no viewport — igual a `_exif_strip_metrics_for_slide` (componente h)."""
+    ph_f = float(ph_f)
+    intr = _viewport_strip_intrinsic_height(ek, pairs, ph_f)
+    if ek.startswith("v_"):
+        cap = min(ph_f * 0.90, float(EXIF_VIEW_H_VERT))
+        return float(min(ph_f - 1.0, max(48.0, min(cap, intr + 8.0))))
+    return float(min(ph_f - 1.0, max(48.0, intr + 6.0)))
+
+
 def _export_strip_geometry_pixels(
     iw: int,
     ih: int,
@@ -864,7 +897,7 @@ def _export_strip_geometry_pixels(
     if s <= 1e-12 or dw < 2 or dh < 2:
         return None
     ek = _effective_exif_placement_ui(iw, ih, placement)
-    left, top, sw_v, sh_v = _viewport_exif_strip_rect(
+    left, top, sw_v, _sh_tpl = _viewport_exif_strip_rect(
         nx_ui,
         ny_ui,
         pw,
@@ -874,8 +907,15 @@ def _export_strip_geometry_pixels(
         width_frac=strip_width_frac,
         v_strip_width_scale=strip_v_w_scale,
     )
-    sh_use = max(float(sh_v), _viewport_strip_intrinsic_height(ek, pairs, ph))
-    sh_use = min(sh_use, ph - 2.0)
+    sh_use = _viewport_exif_strip_height_ui(ek, pairs, ph)
+    nxf = max(0.0, min(1.0, float(nx_ui)))
+    nyf = max(0.0, min(1.0, float(ny_ui)))
+    left = nxf * max(0.0, pw - sw_v)
+    if not ek.startswith("v_") and iw > 0 and ih > 0:
+        free_y = _viewport_exif_strip_free_y(iw, ih, pw, ph, ek, sh_use)
+        top = nyf * free_y
+    else:
+        top = nyf * max(0.0, ph - sh_use)
     sw_img = max(1, min(iw, int(round(sw_v / s))))
     sh_img = max(1, min(ih, int(round(sh_use / s))))
     img_x = int(round((left - ox) / s))
@@ -883,6 +923,65 @@ def _export_strip_geometry_pixels(
     img_x = max(0, min(img_x, iw - sw_img))
     img_y = max(0, min(img_y, ih - sh_img))
     return img_x, img_y, sw_img, sh_img, float(s)
+
+
+def _export_letterbox_scale(
+    iw: int,
+    ih: int,
+    viewport_pw: int | None,
+    viewport_ph: int | None,
+) -> float | None:
+    """px de imagem por px de viewport (letterbox FIT), igual à geometria da pré-visualização."""
+    if viewport_pw is None or viewport_ph is None or iw <= 0 or ih <= 0:
+        return None
+    _ox, _oy, dw, dh, s = _letterbox_contain(
+        iw, ih, float(viewport_pw), float(viewport_ph)
+    )
+    if s <= 1e-12 or dw < 2 or dh < 2:
+        return None
+    return float(s)
+
+
+def _export_vertical_strip_max_height_px(
+    iw: int,
+    ih: int,
+    viewport_pw: int | None,
+    viewport_ph: int | None,
+    placement: str,
+    pairs: list[tuple[str, str]],
+) -> int:
+    """Altura máxima do painel vertical na bitmap (~tarja compacta da pré-visualização)."""
+    if ih <= 2:
+        return max(8, ih)
+    ek = (placement or "auto").strip().lower()
+    if ek not in EXIF_PLACEMENT_KEYS:
+        ek = "auto"
+    if ek == "auto":
+        ek = _effective_exif_placement_ui(iw, ih, "auto")
+    s = _export_letterbox_scale(iw, ih, viewport_pw, viewport_ph)
+    ph_vp = float(viewport_ph) if viewport_ph else 0.0
+    if s is not None and ph_vp >= 48.0:
+        sh_use = _viewport_exif_strip_height_ui(ek, pairs, ph_vp)
+        return max(48, min(ih - 2, int(round(sh_use / max(s, 1e-12)))))
+    est = _viewport_strip_intrinsic_height(ek, pairs, max(480.0, float(ih)))
+    return max(48, min(ih - 2, int(min(est * 1.12, ih * 0.42, float(EXIF_VIEW_H_VERT) * 1.35))))
+
+
+def _pillow_export_body_font_px(
+    iw: int,
+    ih: int,
+    viewport_pw: int | None,
+    viewport_ph: int | None,
+) -> int:
+    """Fonte da tarja na exportação: alinha a `EXIF_STRIP_UI_BODY_PT` no referencial do ecrã (não ao tamanho bruto da foto)."""
+    s = _export_letterbox_scale(iw, ih, viewport_pw, viewport_ph)
+    if s is not None:
+        sv = max(s, 1e-9)
+        return max(
+            8,
+            min(56, int(round(float(EXIF_STRIP_UI_BODY_PT) / sv))),
+        )
+    return max(8, min(56, _export_exif_font_px(iw)))
 
 
 def _pillow_blend_dark_rect(
@@ -929,98 +1028,105 @@ def _build_exif_overlay_pairs_from_merged(
     *,
     exif_filter: ExifDisplayFilter | None = None,
 ) -> list[tuple[str, str]]:
-    """Lista de (rótulo, valor) para o rodapé; até _MAX_EXIF_OVERLAY_PAIRS entradas."""
+    """Lista de (rótulo, valor) para a tarja; até _MAX_EXIF_OVERLAY_PAIRS entradas."""
     if not merged:
-        return [("EXIF", "Sem metadados")]
-
-    rows: list[tuple[str, str]] = []
-
-    fn = _ratio_to_float(merged.get("FNumber"))
-    if fn is not None and fn > 0:
-        fs = f"{fn:.2f}".rstrip("0").rstrip(".")
-        rows.append(("Aperture", f"f/{fs}"))
-
-    fl = _ratio_to_float(merged.get("FocalLength"))
-    if fl is not None and fl > 0:
-        fl_bits = [f"{fl:g} mm"]
-        fl35 = merged.get("FocalLengthIn35mmFilm")
-        if fl35 is not None and str(fl35).strip():
-            fl_bits.append(f"eq.35mm {fl35}")
-        sd_m = _ratio_to_float(merged.get("SubjectDistance"))
-        if sd_m is not None and 0.01 < sd_m < 1_000_000:
-            fl_bits.append(f"focus {sd_m:g}m")
-        rows.append(("Focal length", " · ".join(fl_bits)))
-
-    lens_make = _exif_tag_string(merged.get("LensMake", ""))
-    lens_model = _exif_tag_string(merged.get("LensModel", ""))
-    lens_spec = merged.get("LensSpecification")
-    lens_line = " ".join(x for x in (lens_make, lens_model) if x).strip()
-    if not lens_line and lens_spec is not None:
-        lens_line = _exif_value_short(lens_spec, 80)
-    if lens_line:
-        rows.append(("Lens", lens_line))
-
-    make, model = _exif_tag_string(merged.get("Make", "")), _exif_tag_string(
-        merged.get("Model", "")
-    )
-    cam = " ".join(x for x in (make, model) if x)
-    if cam:
-        rows.append(("Camera", cam))
-
-    artist = _exif_tag_string(merged.get("Artist", ""))
-    copyright_ = _exif_tag_string(merged.get("Copyright", ""))
-    if artist and copyright_:
-        rows.append(("Owner", artist[:120]))
-        if copyright_ != artist:
-            rows.append(("Copyright", copyright_[:120]))
-    elif artist:
-        rows.append(("Owner", artist[:120]))
-    elif copyright_:
-        rows.append(("Owner", copyright_[:120]))
-
-    exp = _format_exposure_seconds(merged.get("ExposureTime"))
-    if exp:
-        rows.append(("Speed", exp))
-
-    iso = merged.get("PhotographicSensitivity")
-    if iso is None:
-        iso = merged.get("ISOSpeedRatings")
-    if isinstance(iso, tuple) and iso:
-        iso = iso[0]
-    if iso is not None and str(iso).strip():
-        rows.append(("ISO", str(iso)))
+        return [("EXIF", tr("exif_sem_metadados"))]
 
     xf = exif_filter or ExifDisplayFilter()
+    rows: list[tuple[str, str]] = []
 
-    dt = merged.get("DateTimeOriginal") or merged.get("DateTime")
-    if dt and xf.show_date:
-        rows.append(("Date", _exif_tag_string(dt)[:36]))
+    make = _exif_tag_string(merged.get("Make", ""))
+    model = _exif_tag_string(merged.get("Model", ""))
+    if xf.show_camera_make and make:
+        rows.append((tr("exif_row_make"), make))
+    if xf.show_camera_model and model:
+        rows.append((tr("exif_row_model"), model))
 
-    sw = merged.get("Software")
-    if sw and xf.show_software:
-        rows.append(("Software", _exif_tag_string(sw)[:72]))
+    if xf.show_aperture:
+        fn = _ratio_to_float(merged.get("FNumber"))
+        if fn is not None and fn > 0:
+            fs = f"{fn:.2f}".rstrip("0").rstrip(".")
+            rows.append((tr("exif_row_aperture"), f"f/{fs}"))
 
-    ori = merged.get("Orientation")
-    if ori is not None:
-        ol = _orientation_label(ori)
-        rows.append(("Orientation", ol if ol else str(ori)))
+    if xf.show_shutter_speed:
+        exp = _format_exposure_seconds(merged.get("ExposureTime"))
+        if exp:
+            rows.append((tr("exif_row_speed"), exp))
 
-    flash = merged.get("Flash")
-    if flash is not None and str(flash).strip():
-        rows.append(("Flash", str(flash)))
+    if xf.show_other_exif:
+        fl = _ratio_to_float(merged.get("FocalLength"))
+        if fl is not None and fl > 0:
+            fl_bits = [f"{fl:g} mm"]
+            fl35 = merged.get("FocalLengthIn35mmFilm")
+            if fl35 is not None and str(fl35).strip():
+                fl_bits.append(f"eq.35mm {fl35}")
+            sd_m = _ratio_to_float(merged.get("SubjectDistance"))
+            if sd_m is not None and 0.01 < sd_m < 1_000_000:
+                fl_bits.append(f"focus {sd_m:g}m")
+            rows.append((tr("exif_row_focal_length"), " · ".join(fl_bits)))
+
+    if xf.show_lens:
+        lens_make = _exif_tag_string(merged.get("LensMake", ""))
+        lens_model = _exif_tag_string(merged.get("LensModel", ""))
+        lens_spec = merged.get("LensSpecification")
+        lens_line = " ".join(x for x in (lens_make, lens_model) if x).strip()
+        if not lens_line and lens_spec is not None:
+            lens_line = _exif_value_short(lens_spec, 80)
+        if lens_line:
+            rows.append((tr("exif_row_lens"), lens_line))
+
+    if xf.show_author:
+        artist = _exif_tag_string(merged.get("Artist", ""))
+        copyright_ = _exif_tag_string(merged.get("Copyright", ""))
+        if artist:
+            rows.append((tr("exif_row_author"), artist[:120]))
+            if xf.show_other_exif and copyright_ and copyright_ != artist:
+                rows.append((tr("exif_row_copyright"), copyright_[:120]))
+        elif copyright_:
+            rows.append((tr("exif_row_author"), copyright_[:120]))
+
+    if xf.show_date:
+        dt = merged.get("DateTimeOriginal") or merged.get("DateTime")
+        if dt:
+            rows.append((tr("exif_row_date"), _exif_tag_string(dt)[:36]))
+
+    if xf.show_iso:
+        iso = merged.get("PhotographicSensitivity")
+        if iso is None:
+            iso = merged.get("ISOSpeedRatings")
+        if isinstance(iso, tuple) and iso:
+            iso = iso[0]
+        if iso is not None and str(iso).strip():
+            rows.append((tr("exif_row_iso"), str(iso)))
 
     if xf.show_mode:
         mode_line = _capture_mode_description(merged)
         if mode_line:
-            rows.append(("Mode", mode_line))
+            rows.append((tr("exif_row_mode"), mode_line))
 
-    mm = merged.get("MeteringMode")
-    if mm is not None and str(mm).strip():
-        rows.append(("Metering", str(mm)))
+    if xf.show_other_exif:
+        sw = merged.get("Software")
+        if sw:
+            rows.append((tr("exif_row_software"), _exif_tag_string(sw)[:72]))
 
-    wb = merged.get("WhiteBalance")
-    if wb is not None and str(wb).strip():
-        rows.append(("White balance", str(wb)))
+        ori = merged.get("Orientation")
+        if ori is not None:
+            ol = _orientation_label(ori)
+            rows.append(
+                (tr("exif_row_orientation"), ol if ol else str(ori))
+            )
+
+        flash = merged.get("Flash")
+        if flash is not None and str(flash).strip():
+            rows.append((tr("exif_row_flash"), str(flash)))
+
+        mm = merged.get("MeteringMode")
+        if mm is not None and str(mm).strip():
+            rows.append((tr("exif_row_metering"), str(mm)))
+
+        wb = merged.get("WhiteBalance")
+        if wb is not None and str(wb).strip():
+            rows.append((tr("exif_row_white_balance"), str(wb)))
 
     has_photo_meta = bool(_PHOTO_EXIF_ANY_OF & merged.keys()) or any(
         k.startswith("GPS.") for k in merged
@@ -1028,10 +1134,10 @@ def _build_exif_overlay_pairs_from_merged(
 
     if not rows:
         if not has_photo_meta:
-            return [("EXIF", "Sem dados de câmara (só DPI)")]
-        return [("EXIF", "Sem campos úteis")]
+            return [("EXIF", tr("exif_sem_dados_camara"))]
+        return [("EXIF", tr("exif_sem_campos_uteis"))]
 
-    if len(rows) < _MAX_EXIF_OVERLAY_PAIRS:
+    if xf.show_other_exif and len(rows) < _MAX_EXIF_OVERLAY_PAIRS:
         _fb_order = (
             "Make",
             "Model",
@@ -1049,6 +1155,8 @@ def _build_exif_overlay_pairs_from_merged(
         for key in _fb_order:
             if len(rows) >= _MAX_EXIF_OVERLAY_PAIRS:
                 break
+            if key in ("ISOSpeedRatings", "PhotographicSensitivity"):
+                continue
             if key in seen or key not in merged or key in _BORING_EXIF_NAMES:
                 continue
             short = _exif_value_short(merged[key], 56)
@@ -1538,6 +1646,7 @@ def _compose_image_with_exif_strip(
     strip_v_w_scale: float = 1.0,
     strip_opacity: float = 0.58,
     strip_placement: str = "auto",
+    strip_placement_resolved: str | None = None,
     viewport_pw: int | None = None,
     viewport_ph: int | None = None,
 ):
@@ -1560,7 +1669,16 @@ def _compose_image_with_exif_strip(
         s = s.strip()
         return s if len(s) <= mx else s[: mx - 1] + "…"
 
-    branch = _exif_compose_branch(strip_placement, w, h)
+    raw_pl = (strip_placement or "auto").strip().lower()
+    if raw_pl not in EXIF_PLACEMENT_KEYS:
+        raw_pl = "auto"
+    sr = (strip_placement_resolved or "").strip().lower()
+    if sr in EXIF_PLACEMENT_KEYS:
+        res_pl = sr
+    else:
+        res_pl = _effective_exif_placement_ui(w, h, raw_pl)
+
+    branch = _exif_compose_branch(res_pl, w, h)
     geom = _export_strip_geometry_pixels(
         w,
         h,
@@ -1568,7 +1686,7 @@ def _compose_image_with_exif_strip(
         viewport_ph,
         strip_norm_x,
         strip_norm_y,
-        strip_placement,
+        res_pl,
         pairs,
         strip_width_frac=strip_width_frac,
         strip_v_w_scale=strip_v_w_scale,
@@ -1709,8 +1827,16 @@ def _compose_image_with_exif_strip(
             )
             return out
 
-        font_px_v = _export_exif_font_px(w)
-        bh_cap = max(8, h - 2)
+        font_px_v = _pillow_export_body_font_px(w, h, viewport_pw, viewport_ph)
+        bh_cap = max(
+            8,
+            min(
+                h - 2,
+                _export_vertical_strip_max_height_px(
+                    w, h, viewport_pw, viewport_ph, res_pl, pairs
+                ),
+            ),
+        )
         strip_w = 0
         val_mx = 8
         bar_h = 0
@@ -1763,9 +1889,10 @@ def _compose_image_with_exif_strip(
             viewport_ph,
             strip_norm_x,
             strip_norm_y,
-            strip_placement,
+            res_pl,
             strip_w,
             bar_h,
+            pairs,
             strip_width_frac=strip_width_frac,
             strip_v_w_scale=strip_v_w_scale,
         )
@@ -2038,7 +2165,7 @@ def _compose_image_with_exif_strip(
     wf = max(0.38, min(1.0, float(strip_width_frac)))
     strip_w_calc = max(80, min(w, int(w * wf)))
     bh_cap = max(8, h - 2)
-    font_px_h = _export_exif_font_px(w)
+    font_px_h = _pillow_export_body_font_px(w, h, viewport_pw, viewport_ph)
 
     bar_h = 0
     strip_w = strip_w_calc
@@ -2113,9 +2240,10 @@ def _compose_image_with_exif_strip(
         viewport_ph,
         strip_norm_x,
         strip_norm_y,
-        strip_placement,
+        res_pl,
         strip_w,
         bar_h,
+        pairs,
         strip_width_frac=strip_width_frac,
         strip_v_w_scale=strip_v_w_scale,
     )
@@ -2750,9 +2878,16 @@ def main(page: ft.Page) -> None:
     exif_strip_opacity: float = 0.58
     exif_strip_placement: str = "auto"
 
-    exif_sw_soft = ft.Switch(value=True, **_sw_compact)
+    exif_sw_make = ft.Switch(value=True, **_sw_compact)
+    exif_sw_model = ft.Switch(value=True, **_sw_compact)
+    exif_sw_aperture = ft.Switch(value=True, **_sw_compact)
+    exif_sw_speed = ft.Switch(value=True, **_sw_compact)
+    exif_sw_iso = ft.Switch(value=True, **_sw_compact)
+    exif_sw_lens = ft.Switch(value=True, **_sw_compact)
     exif_sw_date = ft.Switch(value=True, **_sw_compact)
+    exif_sw_author = ft.Switch(value=True, **_sw_compact)
     exif_sw_mode = ft.Switch(value=True, **_sw_compact)
+    exif_sw_other = ft.Switch(value=True, **_sw_compact)
     exif_show_strip = ft.Switch(value=True, **_sw_compact)
 
     def _toggle_row(label: str, sw: ft.Switch) -> ft.Row:
@@ -2774,9 +2909,16 @@ def main(page: ft.Page) -> None:
 
     def _get_exif_filter() -> ExifDisplayFilter:
         return ExifDisplayFilter(
-            show_software=exif_sw_soft.value,
+            show_camera_make=exif_sw_make.value,
+            show_camera_model=exif_sw_model.value,
+            show_aperture=exif_sw_aperture.value,
+            show_shutter_speed=exif_sw_speed.value,
+            show_iso=exif_sw_iso.value,
+            show_lens=exif_sw_lens.value,
             show_date=exif_sw_date.value,
+            show_author=exif_sw_author.value,
             show_mode=exif_sw_mode.value,
+            show_other_exif=exif_sw_other.value,
         )
 
     def _effective_placement_for_index(idx: int) -> str:
@@ -2890,9 +3032,19 @@ def main(page: ft.Page) -> None:
         _refresh_exif_bars()
 
     exif_show_strip.on_change = _on_exif_strip_toggle
-    exif_sw_soft.on_change = _on_exif_fields_toggle
-    exif_sw_date.on_change = _on_exif_fields_toggle
-    exif_sw_mode.on_change = _on_exif_fields_toggle
+    for _sw in (
+        exif_sw_make,
+        exif_sw_model,
+        exif_sw_aperture,
+        exif_sw_speed,
+        exif_sw_iso,
+        exif_sw_lens,
+        exif_sw_date,
+        exif_sw_author,
+        exif_sw_mode,
+        exif_sw_other,
+    ):
+        _sw.on_change = _on_exif_fields_toggle
 
     def _estimate_exif_viewport_px() -> tuple[int, int]:
         ww = int(page.window.width or 1100)
@@ -3472,8 +3624,16 @@ def main(page: ft.Page) -> None:
         page.overlay.append(layer)
         page.update()
 
-    def _exif_strip_export_kwargs() -> dict[str, object]:
+    def _exif_strip_export_kwargs(slide_index: int | None = None) -> dict[str, object]:
         vpw, vph = _estimate_exif_viewport_px()
+        if gallery_paths:
+            if slide_index is None:
+                idx = min(page_view.selected_index, len(gallery_paths) - 1)
+            else:
+                idx = max(0, min(int(slide_index), len(gallery_paths) - 1))
+            resolved = _effective_placement_for_index(idx)
+        else:
+            resolved = "h_bottom"
         return {
             "strip_norm_x": exif_strip_nx,
             "strip_norm_y": exif_strip_ny,
@@ -3487,6 +3647,7 @@ def main(page: ft.Page) -> None:
             ),
             "strip_opacity": exif_strip_opacity,
             "strip_placement": exif_strip_placement,
+            "strip_placement_resolved": resolved,
             "viewport_pw": vpw,
             "viewport_ph": vph,
         }
@@ -3622,7 +3783,10 @@ def main(page: ft.Page) -> None:
                 j += 1
             try:
                 im = _compose_image_with_exif_strip(
-                    str(src), merged_i, filt, **_exif_strip_export_kwargs()
+                    str(src),
+                    merged_i,
+                    filt,
+                    **_exif_strip_export_kwargs(slide_index=i),
                 )
                 if dest.suffix.lower() in (".jpg", ".jpeg"):
                     im.save(str(dest), quality=92)
@@ -3695,7 +3859,10 @@ def main(page: ft.Page) -> None:
                 j += 1
             try:
                 im = _compose_image_with_exif_strip(
-                    str(src), merged_i, filt, **_exif_strip_export_kwargs()
+                    str(src),
+                    merged_i,
+                    filt,
+                    **_exif_strip_export_kwargs(slide_index=i),
                 )
                 if dest.suffix.lower() in (".jpg", ".jpeg"):
                     im.save(str(dest), quality=92)
@@ -4019,9 +4186,16 @@ def main(page: ft.Page) -> None:
                             spacing=2,
                             controls=[
                                 _toggle_row(tr("label_exif_strip"), exif_show_strip),
-                                _toggle_row(tr("label_software"), exif_sw_soft),
-                                _toggle_row(tr("label_capture_date"), exif_sw_date),
+                                _toggle_row(tr("exif_sw_make"), exif_sw_make),
+                                _toggle_row(tr("exif_sw_model"), exif_sw_model),
+                                _toggle_row(tr("exif_sw_aperture"), exif_sw_aperture),
+                                _toggle_row(tr("exif_sw_speed"), exif_sw_speed),
+                                _toggle_row(tr("exif_sw_iso"), exif_sw_iso),
+                                _toggle_row(tr("exif_sw_lens"), exif_sw_lens),
+                                _toggle_row(tr("exif_sw_date"), exif_sw_date),
+                                _toggle_row(tr("exif_sw_author"), exif_sw_author),
                                 _toggle_row(tr("label_mode"), exif_sw_mode),
+                                _toggle_row(tr("exif_sw_other"), exif_sw_other),
                                 ft.Row(
                                     alignment=ft.MainAxisAlignment.END,
                                     controls=[
