@@ -91,6 +91,48 @@ def _ratio_to_float(val: object) -> float | None:
     return None
 
 
+def _gps_dms_to_decimal(dms: object) -> float | None:
+    """Converte tuplo GPS (graus, min, seg) para graus decimais."""
+    if dms is None:
+        return None
+    if not isinstance(dms, tuple) or len(dms) < 2:
+        return None
+    try:
+        deg = _ratio_to_float(dms[0])
+        minutes = _ratio_to_float(dms[1]) if len(dms) > 1 else 0.0
+        seconds = _ratio_to_float(dms[2]) if len(dms) > 2 else 0.0
+        if deg is None:
+            return None
+        m = 0.0 if minutes is None else float(minutes)
+        s = 0.0 if seconds is None else float(seconds)
+        if m < 0 or s < 0:
+            return None
+        return float(deg) + (m / 60.0) + (s / 3600.0)
+    except Exception:
+        return None
+
+
+def _gps_location_line_from_merged(merged: dict[str, object]) -> str | None:
+    """Linha curta de localização (lat, lon) a partir de tags GPS.* (se existirem)."""
+    lat = _gps_dms_to_decimal(merged.get("GPS.GPSLatitude"))
+    lon = _gps_dms_to_decimal(merged.get("GPS.GPSLongitude"))
+    if lat is None or lon is None:
+        return None
+    lat_ref = _exif_tag_string(merged.get("GPS.GPSLatitudeRef", "")).upper().strip()
+    lon_ref = _exif_tag_string(merged.get("GPS.GPSLongitudeRef", "")).upper().strip()
+    if lat_ref == "S":
+        lat = -abs(lat)
+    elif lat_ref == "N":
+        lat = abs(lat)
+    if lon_ref == "W":
+        lon = -abs(lon)
+    elif lon_ref == "E":
+        lon = abs(lon)
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return f"{lat:.5f}, {lon:.5f}"
+
+
 _EXIF_DIAL_TOKEN_RE = re.compile(r"\b([UC][123])\b", re.IGNORECASE)
 
 # CIPA ExposureProgram (Exif.Photo.ExposureProgram): códigos de modo de disparo.
@@ -560,6 +602,7 @@ class ExifDisplayFilter:
     show_author: bool = True
     show_iso: bool = True
     show_mode: bool = True
+    show_location: bool = False
     show_other_exif: bool = True
 
 
@@ -1103,6 +1146,11 @@ def _build_exif_overlay_pairs_from_merged(
         mode_line = _capture_mode_description(merged)
         if mode_line:
             rows.append((tr("exif_row_mode"), mode_line))
+
+    if xf.show_location:
+        loc = _gps_location_line_from_merged(merged)
+        if loc:
+            rows.append((tr("exif_row_location"), loc))
 
     if xf.show_other_exif:
         sw = merged.get("Software")
@@ -2557,6 +2605,58 @@ def collect_images_from_dir(folder: Path) -> list[Path]:
     return out
 
 
+def _pil_image_rgb_for_pdf(path: str):
+    """Uma página RGB para PDF (fundo branco se a imagem tiver transparência)."""
+    from PIL import Image
+
+    local = _local_path_for_read(path)
+    im = Image.open(local)
+    im.load()
+    if im.mode == "P":
+        im = im.convert("RGBA")
+    if im.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        im = bg
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    return im
+
+
+def _write_gallery_pdf(paths: list[str], dest: Path) -> tuple[int, int]:
+    """Grava um PDF multi-página. Devolve (páginas escritas, ficheiros ignorados)."""
+    pages: list = []
+    skipped = 0
+    for p in paths:
+        try:
+            fs = _local_path_for_read(p)
+            if not Path(fs).is_file():
+                skipped += 1
+                continue
+            pages.append(_pil_image_rgb_for_pdf(p))
+        except Exception:
+            skipped += 1
+    if not pages:
+        raise ValueError("no_pages")
+    first = pages[0]
+    rest = pages[1:]
+    try:
+        first.save(
+            str(dest),
+            "PDF",
+            save_all=True,
+            append_images=rest,
+            resolution=100.0,
+        )
+    finally:
+        for im in pages:
+            try:
+                im.close()
+            except Exception:
+                pass
+    return len(pages), skipped
+
+
 def _path_resolve_key(p: str) -> str:
     try:
         return str(Path(p).resolve())
@@ -2667,6 +2767,17 @@ def main(page: ft.Page) -> None:
         page.window.height = 840
         page.window.min_width = 560
         page.window.min_height = 420
+        # No modo `flet run`, o ícone da janela precisa ser definido explicitamente.
+        _assets_dir = Path(__file__).resolve().parent / "assets"
+        _window_icon_candidates = (
+            _assets_dir / "icon_windows.ico",
+            _assets_dir / "icon.ico",
+            _assets_dir / "icon.png",
+        )
+        for _icon_path in _window_icon_candidates:
+            if _icon_path.is_file():
+                page.window.icon = str(_icon_path.resolve())
+                break
 
     _inter_fonts: dict[str, str] = {}
     if INTER_FONT_REGULAR.is_file():
@@ -2887,6 +2998,7 @@ def main(page: ft.Page) -> None:
     exif_sw_date = ft.Switch(value=True, **_sw_compact)
     exif_sw_author = ft.Switch(value=True, **_sw_compact)
     exif_sw_mode = ft.Switch(value=True, **_sw_compact)
+    exif_sw_location = ft.Switch(value=False, **_sw_compact)
     exif_sw_other = ft.Switch(value=True, **_sw_compact)
     exif_show_strip = ft.Switch(value=True, **_sw_compact)
 
@@ -2918,6 +3030,7 @@ def main(page: ft.Page) -> None:
             show_date=exif_sw_date.value,
             show_author=exif_sw_author.value,
             show_mode=exif_sw_mode.value,
+            show_location=exif_sw_location.value,
             show_other_exif=exif_sw_other.value,
         )
 
@@ -3042,6 +3155,7 @@ def main(page: ft.Page) -> None:
         exif_sw_date,
         exif_sw_author,
         exif_sw_mode,
+        exif_sw_location,
         exif_sw_other,
     ):
         _sw.on_change = _on_exif_fields_toggle
@@ -3801,6 +3915,80 @@ def main(page: ft.Page) -> None:
         page.snack_bar.open = True
         page.update()
 
+    async def _save_gallery_as_pdf_async() -> None:
+        if page.web:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(tr("snack_web_save"))
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+        if not gallery_paths:
+            return
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(tr("snack_install_pillow"))
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+        await asyncio.sleep(0.12)
+        try:
+            dest = await file_picker.save_file(
+                dialog_title=tr("dialog_save_pdf"),
+                file_name=tr("picker_default_pdf"),
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["pdf"],
+            )
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(tr("snack_dialog_error", ex=ex))
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+        if not dest:
+            return
+        dest_path = Path(dest)
+        if dest_path.suffix.lower() != ".pdf":
+            dest_path = dest_path.with_suffix(".pdf")
+        _show_gallery_loading(tr("loading_pdf"))
+        try:
+            await asyncio.sleep(0)
+            n_ok, n_skip = await asyncio.to_thread(
+                _write_gallery_pdf, gallery_paths, dest_path
+            )
+        except ValueError:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(tr("snack_pdf_no_pages"))
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(tr("snack_save_error", ex=ex))
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+        finally:
+            _hide_gallery_loading()
+        if n_skip:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(
+                    tr("snack_pdf_partial", n=n_ok, skipped=n_skip)
+                )
+            )
+        else:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(tr("snack_pdf_saved", name=dest_path.name))
+            )
+        page.snack_bar.open = True
+        page.update()
+
     async def _save_selected_with_strip_async() -> None:
         if page.web:
             page.snack_bar = ft.SnackBar(
@@ -4083,6 +4271,11 @@ def main(page: ft.Page) -> None:
                 icon=ft.Icons.FOLDER_SPECIAL,
                 on_click=lambda _: page.run_task(_save_all_with_strip_async),
             ),
+            ft.PopupMenuItem(
+                content=tr("menu_item_save_pdf"),
+                icon=ft.Icons.PICTURE_AS_PDF,
+                on_click=lambda _: page.run_task(_save_gallery_as_pdf_async),
+            ),
         ],
     )
     _menu_help = ft.PopupMenuButton(
@@ -4195,6 +4388,7 @@ def main(page: ft.Page) -> None:
                                 _toggle_row(tr("exif_sw_date"), exif_sw_date),
                                 _toggle_row(tr("exif_sw_author"), exif_sw_author),
                                 _toggle_row(tr("label_mode"), exif_sw_mode),
+                                _toggle_row(tr("exif_sw_location"), exif_sw_location),
                                 _toggle_row(tr("exif_sw_other"), exif_sw_other),
                                 ft.Row(
                                     alignment=ft.MainAxisAlignment.END,

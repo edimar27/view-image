@@ -106,6 +106,13 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "menu_item_save_current": "Guardar slide atual com tarja…",
         "menu_item_save_marked": "Guardar miniaturas marcadas…",
         "menu_item_save_all": "Guardar toda a galeria…",
+        "menu_item_save_pdf": "Guardar galeria como PDF…",
+        "dialog_save_pdf": "Guardar PDF com todas as imagens da galeria",
+        "picker_default_pdf": "imagens.pdf",
+        "loading_pdf": "A criar PDF…",
+        "snack_pdf_saved": "PDF guardado: {name}",
+        "snack_pdf_partial": "PDF com {n} página(s); {skipped} ficheiro(s) ignorado(s).",
+        "snack_pdf_no_pages": "Não foi possível criar o PDF (nenhuma imagem válida).",
         "menu_item_about": "Acerca do Ed Image Preview",
         "about_body": (
             "Visualizador de imagens com tarja EXIF integrada.\n\n"
@@ -139,6 +146,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "exif_row_orientation": "Orientação",
         "exif_row_flash": "Flash",
         "exif_row_mode": "Modo",
+        "exif_row_location": "Localização",
         "exif_row_metering": "Medição",
         "exif_row_white_balance": "Balanço de brancos",
         "exif_sw_make": "Marca da câmara",
@@ -149,6 +157,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "exif_sw_date": "Data",
         "exif_sw_author": "Autor",
         "exif_sw_iso": "ISO",
+        "exif_sw_location": "Localização (GPS)",
         "exif_sw_other": "Outros metadados (software, orientação…)",
     },
     "en": {
@@ -240,6 +249,13 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "menu_item_save_current": "Save current slide with strip…",
         "menu_item_save_marked": "Save marked thumbnails…",
         "menu_item_save_all": "Save entire gallery…",
+        "menu_item_save_pdf": "Save gallery as PDF…",
+        "dialog_save_pdf": "Save PDF with all images in the gallery",
+        "picker_default_pdf": "images.pdf",
+        "loading_pdf": "Creating PDF…",
+        "snack_pdf_saved": "PDF saved: {name}",
+        "snack_pdf_partial": "PDF with {n} page(s); {skipped} file(s) skipped.",
+        "snack_pdf_no_pages": "Could not create the PDF (no valid images).",
         "menu_item_about": "About Ed Image Preview",
         "about_body": (
             "Image viewer with an integrated EXIF overlay strip.\n\n"
@@ -273,6 +289,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "exif_row_orientation": "Orientation",
         "exif_row_flash": "Flash",
         "exif_row_mode": "Mode",
+        "exif_row_location": "Location",
         "exif_row_metering": "Metering",
         "exif_row_white_balance": "White balance",
         "exif_sw_make": "Camera make",
@@ -283,6 +300,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "exif_sw_date": "Date",
         "exif_sw_author": "Author",
         "exif_sw_iso": "ISO",
+        "exif_sw_location": "Location (GPS)",
         "exif_sw_other": "Other metadata (software, orientation…)",
     },
 }
