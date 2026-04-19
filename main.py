@@ -20,6 +20,9 @@ Veja: https://flet.dev/docs/publish
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import math
 import os
 import re
 import sys
@@ -489,6 +492,8 @@ def _exif_tag_string(val: object) -> str:
 _ASSETS_CAMERA_LOGOS = Path(__file__).resolve().parent / "assets" / "camera_logos"
 # Inter (SIL OFL) — ficheiros em assets/fonts/; licença: assets/fonts/LICENSE.txt
 _ASSET_FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+# PNG do diafragma na exportação do painel borrado (ver ``_pillow_blur_dup_paste_aperture_export_icon``).
+APERTURE_EXPORT_ICON_PATH = Path(__file__).resolve().parent / "assets" / "aperture_export.png"
 INTER_FONT_REGULAR = _ASSET_FONTS_DIR / "Inter-Regular.ttf"
 INTER_FONT_MEDIUM = _ASSET_FONTS_DIR / "Inter-Medium.ttf"
 INTER_FONT_SEMIBOLD = _ASSET_FONTS_DIR / "Inter-SemiBold.ttf"
@@ -628,8 +633,53 @@ EXIF_STRIP_PANEL_RGB = (37, 42, 52)
 # Tamanhos lógicos da tarja no ecrã (exportação escala por letterbox).
 EXIF_STRIP_UI_BODY_PT = 11
 EXIF_STRIP_UI_CREDIT_PT = 9
+# Texto na imagem exportada: menor que o referencial do ecrã (UI mantém 11/9 pt).
+EXIF_STRIP_EXPORT_FONT_SCALE = 0.68
+# Tarja EXIF exportada: teto do corpo em px (evita letras enormes em fotos muito grandes).
+EXIF_STRIP_EXPORT_BODY_PX_MAX = 40
 EXIF_STRIP_UI_PAD_H = 14
 EXIF_STRIP_UI_PAD_V = 11
+# Painel duplicado (fallback): desfoque no widget se Pillow não gerar PNG borrado.
+BLUR_DUP_PANEL_SIGMA_X = 200.0
+BLUR_DUP_PANEL_SIGMA_Y = 200.0
+# UI Flet (painel borrado): mesmos pt que a exportação usa como referência de escala.
+# ~70% dos tamanhos anteriores (−30% para harmonia com a imagem).
+BLUR_DUP_UI_TEXT_PT = 9
+BLUR_DUP_UI_ICON_PT = 14
+# Export: ícones do painel borrado (PNG) — escala sobre ratio×UI_PT (texto e ícone mais próximos).
+BLUR_DUP_EXPORT_ICON_SCALE = 1.52 * 1.5 * 1.5
+# Encolhe texto/ícones do painel borrado na exportação (após escolha por área ×0,86×0,7).
+BLUR_DUP_EXPORT_EXTRA_SHRINK = 0.72
+# Metade do tamanho efetivo só no PNG exportado (não em ``_blur_dup_export_measure_block`` — senão o binário compensa).
+BLUR_DUP_EXPORT_PANEL_FONT_SCALE = 0.5
+BLUR_DUP_EXPORT_ICON_PX_MIN = 12
+BLUR_DUP_EXPORT_ICON_PX_MAX = 70
+# Export: bloco EXIF no painel borrado ocupa até esta fração da largura e da altura (75% × 75%).
+BLUR_DUP_EXPORT_AREA_FRAC = 0.75
+
+
+def _exif_strip_export_cred_px(body_px: int) -> int:
+    """Crédito/@ na tarja exportada: ~2 px abaixo do corpo (proporção próxima de 11/9 na UI)."""
+    b = int(body_px)
+    return max(6, min(36, b - 2))
+
+
+def _exif_strip_export_icon_px(cred_px: int) -> int:
+    """Ícone junto ao crédito na tarja exportada."""
+    c = int(cred_px)
+    return max(8, min(18, c + 3))
+
+
+def _blur_dup_export_body_font_px(picked: int) -> int:
+    """Corpo após escolha por área (×0,86×0,7×`BLUR_DUP_EXPORT_EXTRA_SHRINK`). No PNG, aplica-se ainda `BLUR_DUP_EXPORT_PANEL_FONT_SCALE`."""
+    return max(
+        8,
+        int(
+            round(
+                float(picked) * 0.86 * 0.7 * float(BLUR_DUP_EXPORT_EXTRA_SHRINK)
+            )
+        ),
+    )
 
 
 def _exif_strip_typography() -> tuple[
@@ -1016,15 +1066,24 @@ def _pillow_export_body_font_px(
     viewport_pw: int | None,
     viewport_ph: int | None,
 ) -> int:
-    """Fonte da tarja na exportação: alinha a `EXIF_STRIP_UI_BODY_PT` no referencial do ecrã (não ao tamanho bruto da foto)."""
+    """Fonte da tarja na exportação: base em `EXIF_STRIP_UI_BODY_PT` no referencial do ecrã, com `EXIF_STRIP_EXPORT_FONT_SCALE`."""
     s = _export_letterbox_scale(iw, ih, viewport_pw, viewport_ph)
+    sc = float(EXIF_STRIP_EXPORT_FONT_SCALE)
     if s is not None:
         sv = max(s, 1e-9)
         return max(
             8,
-            min(56, int(round(float(EXIF_STRIP_UI_BODY_PT) / sv))),
+            min(
+                EXIF_STRIP_EXPORT_BODY_PX_MAX,
+                int(
+                    round(float(EXIF_STRIP_UI_BODY_PT) * sc / sv),
+                ),
+            ),
         )
-    return max(8, min(56, _export_exif_font_px(iw)))
+    return max(
+        8,
+        min(EXIF_STRIP_EXPORT_BODY_PX_MAX, int(round(float(_export_exif_font_px(iw)) * sc))),
+    )
 
 
 def _pillow_blend_dark_rect(
@@ -1374,6 +1433,473 @@ def _exif_overlay_single_column_from_pairs(pairs: list[tuple[str, str]]) -> ft.C
     )
 
 
+def _exif_blur_dup_aperture_text(merged: dict[str, object]) -> str:
+    fn = _ratio_to_float(merged.get("FNumber"))
+    if fn is not None and fn > 0:
+        fs = f"{fn:.2f}".rstrip("0").rstrip(".")
+        return f"f/{fs}"
+    return "—"
+
+
+def _exif_blur_dup_speed_text(merged: dict[str, object]) -> str:
+    exp = _format_exposure_seconds(merged.get("ExposureTime"))
+    return exp if exp else "—"
+
+
+def _exif_blur_dup_iso_text(merged: dict[str, object]) -> str:
+    iso = merged.get("PhotographicSensitivity")
+    if iso is None:
+        iso = merged.get("ISOSpeedRatings")
+    if isinstance(iso, tuple) and iso:
+        iso = iso[0]
+    if iso is not None and str(iso).strip():
+        return str(iso)
+    return "—"
+
+
+def _exif_blur_dup_zoom_text(merged: dict[str, object]) -> str:
+    z = _ratio_to_float(merged.get("DigitalZoomRatio"))
+    if z is not None and z > 0:
+        s = f"{z:.2f}".rstrip("0").rstrip(".")
+        return f"{s}×" if s else "—"
+    fl = _ratio_to_float(merged.get("FocalLength"))
+    if fl is not None and fl > 0:
+        return f"{fl:g} mm"
+    return "—"
+
+
+def _exif_primary_make_model_line(make: str, model: str) -> str:
+    """Nome principal câmara/objetiva: evita «Marca Marca Modelo» quando o modelo já inclui a marca."""
+    make = (make or "").strip()
+    model = (model or "").strip()
+    if not model:
+        return make or "—"
+    if not make:
+        return " ".join(model.split())
+    ml, mol = make.lower(), model.lower()
+    if mol.startswith(ml):
+        if len(mol) == len(ml):
+            return make
+        if mol[len(ml)] in " \t-_":
+            return " ".join(model.split())
+    return " ".join(f"{make} {model}".split())
+
+
+def _exif_lens_primary_line(lm: str, ln: str, spec: object | None) -> str:
+    """Nome principal da objetiva: deduplica marca; corta sufixo após «|» (ex.: montagem duplicada)."""
+    line = _exif_primary_make_model_line(lm, ln)
+    if not line or line == "—":
+        if spec is not None:
+            s = _exif_value_short(spec, 48)
+            return " ".join(s.split()) if s else "—"
+        return "—"
+    if "|" in line:
+        line = line.split("|", 1)[0].strip()
+    return " ".join(line.split()) if line else "—"
+
+
+def _exif_blur_dup_camera_text(merged: dict[str, object], *, for_export: bool = False) -> str:
+    make = _exif_tag_string(merged.get("Make", ""))
+    model = _exif_tag_string(merged.get("Model", ""))
+    if for_export:
+        s = _exif_primary_make_model_line(make, model)
+        return s if s and s != "—" else "—"
+    line = " ".join(x for x in (make, model) if x).strip()
+    return line if line else "—"
+
+
+def _exif_blur_dup_lens_text(merged: dict[str, object], *, for_export: bool = False) -> str:
+    lm = _exif_tag_string(merged.get("LensMake", ""))
+    ln = _exif_tag_string(merged.get("LensModel", ""))
+    spec = merged.get("LensSpecification")
+    if for_export:
+        return _exif_lens_primary_line(lm, ln, spec)
+    line = " ".join(x for x in (lm, ln) if x).strip()
+    if line:
+        return line
+    if spec is not None:
+        s = _exif_value_short(spec, 80)
+        if s:
+            return s
+    return "—"
+
+
+def _exif_blur_dup_author_text(merged: dict[str, object]) -> str:
+    artist = _exif_tag_string(merged.get("Artist", ""))
+    if artist:
+        return artist
+    cop = _exif_tag_string(merged.get("Copyright", ""))
+    return cop if cop else "—"
+
+
+_blur_dup_ui_icon_png_cache: dict[tuple[str, int], bytes] = {}
+
+
+def _blur_dup_raster_export_icon_png(kind: str, size: int) -> bytes:
+    """Ícone igual à exportação Pillow (``_pillow_blur_dup_draw_export_icon``), em PNG RGBA."""
+    s = int(max(10, min(96, round(size))))
+    key = (kind, s)
+    hit = _blur_dup_ui_icon_png_cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return b""
+    im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(im)
+    fg = (245, 248, 255)
+    _pillow_blur_dup_draw_export_icon(
+        draw, kind, 0, 0, s, fg, target_rgb=im
+    )
+    buf = io.BytesIO()
+    im.save(buf, "PNG", compress_level=6)
+    out = buf.getvalue()
+    _blur_dup_ui_icon_png_cache[key] = out
+    return out
+
+
+def _blur_dup_overlay_row(kind: str, text: str) -> ft.Row:
+    """Linha do painel borrado: mesmo glifo que na exportação + Inter SemiBold como na tarja Pillow."""
+    _typ = _exif_strip_typography()
+    vf, vfb = _typ[1]
+    png = _blur_dup_raster_export_icon_png(kind, BLUR_DUP_UI_ICON_PT)
+    # Igual a ``gap_tx`` na exportação com ratio = font_px / BLUR_DUP_UI_TEXT_PT e font_px = BLUR_DUP_UI_TEXT_PT.
+    gap_tx = max(6, int(round(10.0)))
+    icon_controls: list[ft.Control] = []
+    if png:
+        b64 = base64.b64encode(png).decode("ascii")
+        icon_controls.append(
+            ft.Image(
+                src=f"data:image/png;base64,{b64}",
+                width=float(BLUR_DUP_UI_ICON_PT),
+                height=float(BLUR_DUP_UI_ICON_PT),
+                fit=ft.BoxFit.CONTAIN,
+                filter_quality=ft.FilterQuality.MEDIUM,
+            )
+        )
+    else:
+        icon_controls.append(
+            ft.Container(
+                width=float(BLUR_DUP_UI_ICON_PT),
+                height=float(BLUR_DUP_UI_ICON_PT),
+            )
+        )
+    return ft.Row(
+        alignment=ft.MainAxisAlignment.START,
+        spacing=float(gap_tx),
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            *icon_controls,
+            ft.Text(
+                text,
+                size=float(BLUR_DUP_UI_TEXT_PT),
+                weight=ft.FontWeight.W_600,
+                font_family=vf,
+                font_family_fallback=vfb,
+                color=ft.Colors.with_opacity(0.95, ft.Colors.WHITE),
+                max_lines=2,
+                overflow=ft.TextOverflow.ELLIPSIS,
+                expand=True,
+                text_align=ft.TextAlign.START,
+            ),
+        ],
+    )
+
+
+def _blur_dup_overlay_footer_ft() -> ft.Column:
+    """Rodapé como na exportação: ``[tool.flet]`` artifact + copyright, fontes pequenas."""
+    prod, cop = _flet_pyproject_footer_lines()
+    _, (vf, vfb), (cf, cfb) = _exif_strip_typography()
+    title_pt = float(max(6, int(round(BLUR_DUP_UI_TEXT_PT * 0.62))))
+    copy_pt = float(max(5.0, title_pt - 1.0))
+    return ft.Column(
+        tight=True,
+        spacing=2.0,
+        horizontal_alignment=ft.CrossAxisAlignment.START,
+        controls=[
+            ft.Text(
+                prod,
+                size=title_pt,
+                weight=ft.FontWeight.W_600,
+                font_family=vf,
+                font_family_fallback=vfb,
+                color=ft.Colors.with_opacity(0.88, ft.Colors.WHITE),
+            ),
+            ft.Text(
+                cop,
+                size=copy_pt,
+                weight=ft.FontWeight.W_400,
+                font_family=cf,
+                font_family_fallback=cfb,
+                color=ft.Colors.with_opacity(0.8, ft.Colors.WHITE),
+            ),
+        ],
+    )
+
+
+def _build_blur_duplicate_overlay_column(merged: dict[str, object]) -> ft.Column:
+    """Metadados no painel desfocado: mesma ordem, textos e ícones que ``_pillow_blur_dup_export_overlay_on_rgb``."""
+    ratio_ln = BLUR_DUP_UI_TEXT_PT / float(BLUR_DUP_UI_TEXT_PT)
+    row_h = max(
+        BLUR_DUP_UI_ICON_PT + 2,
+        BLUR_DUP_UI_TEXT_PT + 7,
+    )
+    gap_block = int(round(row_h * 0.58))
+    rows: list[tuple[str, str] | None] = [
+        ("aperture", _exif_blur_dup_aperture_text(merged)),
+        ("shutter", _exif_blur_dup_speed_text(merged)),
+        ("iso", _exif_blur_dup_iso_text(merged)),
+        ("zoom", _exif_blur_dup_zoom_text(merged)),
+        None,
+        ("camera", _exif_blur_dup_camera_text(merged, for_export=True)),
+        ("lens", _exif_blur_dup_lens_text(merged, for_export=True)),
+        ("person", _exif_blur_dup_author_text(merged)),
+    ]
+    line_gap = max(5, int(round(8 * ratio_ln)))
+    controls: list[ft.Control] = []
+    for i, item in enumerate(rows):
+        if item is None:
+            controls.append(ft.Container(height=float(gap_block)))
+            continue
+        k, txt = item
+        controls.append(_blur_dup_overlay_row(k, txt))
+        if i + 1 < len(rows):
+            controls.append(ft.Container(height=float(line_gap)))
+    controls.append(
+        ft.Container(
+            padding=ft.padding.only(top=max(4.0, float(BLUR_DUP_UI_TEXT_PT * 0.45))),
+            content=_blur_dup_overlay_footer_ft(),
+        )
+    )
+    return ft.Column(
+        spacing=0.0,
+        tight=True,
+        horizontal_alignment=ft.CrossAxisAlignment.START,
+        controls=controls,
+    )
+
+
+def _pillow_rgb_heavily_blurred(im):
+    """RGB Pillow: forte desfoque Gaussian (mesma lógica que o PNG da UI)."""
+    from PIL import Image, ImageFilter
+
+    out = im.convert("RGB")
+    w, h = out.size
+    if w <= 0 or h <= 0:
+        return out
+    m = max(w, h)
+    cap = 1280
+    if m > cap:
+        s = cap / float(m)
+        nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+        out = out.resize((nw, nh), Image.Resampling.LANCZOS)
+    for _ in range(4):
+        out = out.filter(ImageFilter.GaussianBlur(18))
+    return out
+
+
+def _pillow_write_heavily_blurred_duplicate(local_path: str, dest_path: str) -> bool:
+    """Grava PNG: cópia da imagem com desfoque Gaussian forte (duplicata «borrada» real nos píxeis)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        with Image.open(local_path) as src:
+            out = _pillow_rgb_heavily_blurred(src)
+        out.save(dest_path, "PNG", compress_level=6)
+        return Path(dest_path).is_file()
+    except Exception:
+        try:
+            if os.path.isfile(dest_path):
+                os.unlink(dest_path)
+        except OSError:
+            pass
+        return False
+
+
+def _build_blur_duplicate_slide_panel(
+    img_src: str,
+    merged: dict[str, object],
+    *,
+    apply_ui_blur: bool = True,
+    image_width: int = 3,
+    image_height: int = 2,
+    slide_index: int = 0,
+    blur_dup_layout_refs: list[tuple[ft.Container, ft.Container]] | None = None,
+    blur_exif_box_refs: list[ft.Container] | None = None,
+    strip_opacity: float = 0.58,
+    blur_pan_start=None,
+    blur_pan_update=None,
+    blur_pan_end=None,
+    blur_resize_start=None,
+    blur_resize_update=None,
+    blur_resize_end=None,
+    blur_layout_strip_ix=None,
+) -> ft.Container:
+    """Painel à direita: imagem duplicada borrada + texto EXIF com ícones.
+
+    O texto segue o rectângulo letterbox da foto (``BoxFit.CONTAIN``), como na exportação
+    Pillow. Opcionalmente, ``blur_dup_layout_refs`` + callbacks activam arrastar e redimensionar
+    a tarja (como na tarja EXIF principal).
+
+    Se ``apply_ui_blur`` for falso, ``img_src`` já aponta para um PNG gerado pelo Pillow
+    (sem ``ft.Blur`` no widget, para evitar duplo desfoque).
+    """
+    overlay = _build_blur_duplicate_overlay_column(merged)
+    iw = max(1, int(image_width))
+    ih = max(1, int(image_height))
+    blur_kw: dict[str, object] = {}
+    if apply_ui_blur:
+        blur_kw["blur"] = ft.Blur(BLUR_DUP_PANEL_SIGMA_X, BLUR_DUP_PANEL_SIGMA_Y)
+    dup_image = ft.Image(
+        src=img_src,
+        fit=ft.BoxFit.CONTAIN,
+        expand=True,
+        filter_quality=ft.FilterQuality.MEDIUM,
+    )
+    use_interactive = blur_dup_layout_refs is not None and (
+        blur_pan_start is not None
+        and blur_pan_update is not None
+        and blur_pan_end is not None
+        and blur_resize_start is not None
+        and blur_resize_update is not None
+        and blur_resize_end is not None
+        and blur_layout_strip_ix is not None
+    )
+    strip_outer = ft.Container(
+        left=0,
+        top=0,
+        width=max(120, iw),
+        height=200,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+    )
+    if use_interactive:
+        op = max(0.12, min(1.0, float(strip_opacity)))
+        blur_exif_box = ft.Container(
+            padding=ft.Padding.symmetric(horizontal=10, vertical=10),
+            bgcolor=ft.Colors.with_opacity(op, EXIF_STRIP_PANEL_HEX),
+            border_radius=EXIF_STRIP_CORNER_RADIUS,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            tooltip=tr("exif_drag_tooltip"),
+            shadow=[
+                ft.BoxShadow(
+                    spread_radius=0,
+                    blur_radius=14,
+                    color=ft.Colors.with_opacity(0.38, ft.Colors.BLACK),
+                    offset=ft.Offset(0, 4),
+                ),
+            ],
+            content=overlay,
+        )
+        blur_move_gd = ft.GestureDetector(
+            mouse_cursor=ft.MouseCursor.GRAB,
+            on_pan_start=blur_pan_start,
+            on_pan_update=lambda e, ix=slide_index: blur_pan_update(e, ix),
+            on_pan_end=blur_pan_end,
+            content=blur_exif_box,
+        )
+        blur_resize_gd = ft.GestureDetector(
+            mouse_cursor=ft.MouseCursor.RESIZE_DOWN_RIGHT,
+            on_pan_start=blur_resize_start,
+            on_pan_update=lambda e, ix=slide_index: blur_resize_update(e, ix),
+            on_pan_end=blur_resize_end,
+            content=ft.Container(width=24, height=24),
+        )
+        strip_outer.content = ft.Stack(
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            controls=[
+                ft.Container(content=blur_move_gd),
+                ft.Container(
+                    right=0,
+                    bottom=0,
+                    width=28,
+                    height=28,
+                    content=blur_resize_gd,
+                ),
+            ],
+        )
+    else:
+        strip_outer.expand = True
+        strip_outer.alignment = ft.Alignment(-1.0, 0.0)
+        strip_outer.padding = ft.Padding.symmetric(horizontal=14, vertical=16)
+        strip_outer.content = overlay
+
+    overlay_tile = ft.Container(
+        left=0,
+        top=0,
+        width=max(120, iw),
+        height=max(80, ih),
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        padding=ft.Padding.all(0),
+        content=ft.Stack(
+            expand=True,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            controls=[strip_outer],
+        ),
+    )
+    if use_interactive:
+        blur_dup_layout_refs.append((overlay_tile, strip_outer))
+        if blur_exif_box_refs is not None:
+            blur_exif_box_refs.append(blur_exif_box)
+
+    def _on_blur_stack_resize(e: ft.LayoutSizeChangeEvent) -> None:
+        pw = max(1, int(round(float(e.width))))
+        ph = max(1, int(round(float(e.height))))
+        ox, oy, dw, dh, _ = _letterbox_contain(iw, ih, float(pw), float(ph))
+        lx, ly = int(round(ox)), int(round(oy))
+        lw_, lh_ = max(1, int(round(dw))), max(1, int(round(dh)))
+        geom = (lx, ly, lw_, lh_)
+        if getattr(overlay_tile, "_blur_overlay_geom", None) == geom:
+            return
+        overlay_tile._blur_overlay_geom = geom  # type: ignore[attr-defined]
+        overlay_tile.left = lx
+        overlay_tile.top = ly
+        overlay_tile.width = lw_
+        overlay_tile.height = lh_
+        if blur_layout_strip_ix is not None:
+            blur_layout_strip_ix(slide_index)
+        pg = getattr(e.control, "page", None)
+        if pg is not None:
+            pg.update()
+
+    img_layer = ft.Container(
+        expand=True,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        bgcolor=ft.Colors.BLACK,
+        alignment=ft.Alignment.CENTER,
+        content=ft.Container(
+            expand=True,
+            alignment=ft.Alignment.CENTER,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            content=dup_image,
+            **blur_kw,
+        ),
+    )
+    inner_stack = ft.Stack(
+        expand=True,
+        fit=ft.StackFit.EXPAND,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        size_change_interval=100,
+        on_size_change=_on_blur_stack_resize,
+        controls=[
+            img_layer,
+            ft.Container(
+                expand=True,
+                bgcolor=ft.Colors.with_opacity(0.38, ft.Colors.BLACK),
+            ),
+            overlay_tile,
+        ],
+    )
+    return ft.Container(
+        expand=True,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        bgcolor=ft.Colors.BLACK,
+        content=inner_stack,
+    )
+
+
 def _exif_overlay_two_columns(path: Path | str) -> ft.Column:
     return _exif_overlay_two_columns_from_pairs(_build_exif_overlay_pairs(path))
 
@@ -1679,8 +2205,8 @@ def _pillow_draw_exif_footer_soft_instagram(
 
 
 def _export_exif_font_px(image_width: int) -> int:
-    """Pontos de fonte na exportação (legível em 4K, proporcional à largura)."""
-    return max(15, min(36, int(image_width * 0.0235)))
+    """Pontos de fonte na exportação sem viewport (proporcional à largura, teto mais baixo)."""
+    return max(11, min(26, int(image_width * 0.0165)))
 
 
 def _compose_image_with_exif_strip(
@@ -1688,6 +2214,7 @@ def _compose_image_with_exif_strip(
     merged: dict[str, object],
     exif_filter: ExifDisplayFilter,
     *,
+    draw_exif_strip: bool = True,
     strip_norm_x: float = 0.5,
     strip_norm_y: float = 1.0,
     strip_width_frac: float = EXIF_STRIP_WIDTH_FRAC,
@@ -1701,12 +2228,14 @@ def _compose_image_with_exif_strip(
     """RGB com as mesmas dimensões da original; tarja EXIF semi-opaca sobreposta."""
     from PIL import Image, ImageDraw
 
-    pairs = _build_exif_overlay_pairs_from_merged(merged, exif_filter=exif_filter)
     local = _local_path_for_read(image_path)
     with Image.open(local) as im0:
         im = im0.convert("RGB")
     w, h = im.size
     out = im.copy()
+    if not draw_exif_strip:
+        return out
+    pairs = _build_exif_overlay_pairs_from_merged(merged, exif_filter=exif_filter)
     draw = ImageDraw.Draw(out)
 
     rgb_l, rgb_v, rgb_c = _exif_export_fg_rgb()
@@ -1746,13 +2275,14 @@ def _compose_image_with_exif_strip(
             sw_box = max(60, min(sw_box, w - sx))
             sh_box = max(8, min(sh_box, h - sy))
             sv = max(s_vp, 1e-9)
+            _efs = float(EXIF_STRIP_EXPORT_FONT_SCALE)
             font_px_v = max(
                 8,
-                min(56, int(round(float(EXIF_STRIP_UI_BODY_PT) / sv))),
+                min(EXIF_STRIP_EXPORT_BODY_PX_MAX, int(round(float(EXIF_STRIP_UI_BODY_PT) * _efs / sv))),
             )
             cred_px = max(
                 7,
-                min(44, int(round(float(EXIF_STRIP_UI_CREDIT_PT) / sv))),
+                min(32, int(round(float(EXIF_STRIP_UI_CREDIT_PT) * _efs / sv))),
             )
             pad_h = max(8, int(round(float(EXIF_STRIP_UI_PAD_H) / sv)))
             pad_v = max(8, int(round(float(EXIF_STRIP_UI_PAD_V) / sv)))
@@ -1780,7 +2310,7 @@ def _compose_image_with_exif_strip(
                     _trunc,
                 )
                 gap_mid = max(3, gap // 2)
-                icon_px = max(10, min(22, cred_px + 4))
+                icon_px = _exif_strip_export_icon_px(cred_px)
                 credit_h = _exif_footer_reserved_height(
                     d0, font_cred, cred_sw, gap, icon_px
                 )
@@ -1821,7 +2351,7 @@ def _compose_image_with_exif_strip(
                 d0, font_v, vw, max(8, min(120, vw // 3)), (pairs, []), sw_v, _trunc
             )
             gap_mid = max(3, gap // 2)
-            icon_px = max(10, min(22, cred_px + 4))
+            icon_px = _exif_strip_export_icon_px(cred_px)
             credit_h_draw = _exif_footer_reserved_height(
                 d0, font_cred, cred_sw, gap, icon_px
             )
@@ -1896,11 +2426,11 @@ def _compose_image_with_exif_strip(
             inner_w = max(24, strip_w - 2 * pad)
             lw, vw = _exif_row_label_value_widths(inner_w, spacing)
             font_l, font_v, font_cred = _pillow_exif_strip_fonts(
-                font_px_v, max(9, font_px_v - 7)
+                font_px_v, _exif_strip_export_cred_px(font_px_v)
             )
             sw_l = _pillow_exif_stroke_width(font_px_v)
             sw_v = sw_l
-            cred_sw = _pillow_exif_stroke_width(max(9, font_px_v - 7))
+            cred_sw = _pillow_exif_stroke_width(_exif_strip_export_cred_px(font_px_v))
             scratch = Image.new("RGB", (strip_w, max(h, 800)), (48, 48, 52))
             d0 = ImageDraw.Draw(scratch)
             val_mx = _tighten_exif_val_mx_split(
@@ -1912,9 +2442,9 @@ def _compose_image_with_exif_strip(
                 sw_v,
                 _trunc,
             )
-            cred_px_v = max(9, font_px_v - 7)
+            cred_px_v = _exif_strip_export_cred_px(font_px_v)
             gap_mid = max(3, gap // 2)
-            icon_px = max(10, min(22, cred_px_v + 4))
+            icon_px = _exif_strip_export_icon_px(cred_px_v)
             credit_h = _exif_footer_reserved_height(
                 d0, font_cred, cred_sw, gap, icon_px
             )
@@ -1954,19 +2484,19 @@ def _compose_image_with_exif_strip(
         inner_w = max(24, sw2 - 2 * pad)
         lw, vw = _exif_row_label_value_widths(inner_w, spacing)
         font_l, font_v, font_cred = _pillow_exif_strip_fonts(
-            font_px_v, max(9, font_px_v - 7)
+            font_px_v, _exif_strip_export_cred_px(font_px_v)
         )
         sw_l = _pillow_exif_stroke_width(font_px_v)
         sw_v = sw_l
-        cred_sw = _pillow_exif_stroke_width(max(9, font_px_v - 7))
+        cred_sw = _pillow_exif_stroke_width(_exif_strip_export_cred_px(font_px_v))
         scratch = Image.new("RGB", (sw2, max(h, 800)), (48, 48, 52))
         d0 = ImageDraw.Draw(scratch)
         val_mx = _tighten_exif_val_mx_split(
             d0, font_v, vw, max(8, min(72, vw // 3)), (pairs, []), sw_v, _trunc
         )
-        cred_px_v = max(9, font_px_v - 7)
+        cred_px_v = _exif_strip_export_cred_px(font_px_v)
         gap_mid = max(3, gap // 2)
-        icon_px = max(10, min(22, cred_px_v + 4))
+        icon_px = _exif_strip_export_icon_px(cred_px_v)
         credit_h_draw = _exif_footer_reserved_height(
             d0, font_cred, cred_sw, gap, icon_px
         )
@@ -2029,13 +2559,14 @@ def _compose_image_with_exif_strip(
         strip_w = max(80, min(strip_w, w - sx))
         bar_h2 = max(48, min(bar_h2, h - sy))
         sv = max(s_vp, 1e-9)
+        _efh = float(EXIF_STRIP_EXPORT_FONT_SCALE)
         font_px_h = max(
             8,
-            min(56, int(round(float(EXIF_STRIP_UI_BODY_PT) / sv))),
+            min(EXIF_STRIP_EXPORT_BODY_PX_MAX, int(round(float(EXIF_STRIP_UI_BODY_PT) * _efh / sv))),
         )
         cred_px = max(
             7,
-            min(44, int(round(float(EXIF_STRIP_UI_CREDIT_PT) / sv))),
+            min(32, int(round(float(EXIF_STRIP_UI_CREDIT_PT) * _efh / sv))),
         )
         pad_h = max(8, int(round(float(EXIF_STRIP_UI_PAD_H) / sv)))
         pad_v = max(8, int(round(float(EXIF_STRIP_UI_PAD_V) / sv)))
@@ -2076,7 +2607,7 @@ def _compose_image_with_exif_strip(
                 return total - gap + pad_v // 2
 
             gap_mid = max(3, gap // 2)
-            icon_px = max(10, min(22, cred_px + 4))
+            icon_px = _exif_strip_export_icon_px(cred_px)
             credit_h = _exif_footer_reserved_height(
                 d0, font_cred, cred_sw, gap, icon_px
             )
@@ -2127,7 +2658,7 @@ def _compose_image_with_exif_strip(
         x_right = mid + col_gap // 2
         yl = yr = sy + pad_v
         gap_mid = max(3, gap // 2)
-        icon_px = max(10, min(22, cred_px + 4))
+        icon_px = _exif_strip_export_icon_px(cred_px)
         credit_h_draw = _exif_footer_reserved_height(
             d0, font_cred, cred_sw, gap, icon_px
         )
@@ -2230,7 +2761,7 @@ def _compose_image_with_exif_strip(
         gap = max(6, int(font_px_h * 0.28))
         spacing = max(4, int(round(6.0 * font_px_h / float(EXIF_STRIP_UI_BODY_PT))))
         stroke_w = _pillow_exif_stroke_width(font_px_h)
-        cred_px_h = max(9, font_px_h - 7)
+        cred_px_h = _exif_strip_export_cred_px(font_px_h)
         font_l, font_v, font_cred = _pillow_exif_strip_fonts(font_px_h, cred_px_h)
         sw_l = stroke_w
         sw_v = stroke_w
@@ -2264,7 +2795,7 @@ def _compose_image_with_exif_strip(
             return total - gap + pad // 2
 
         gap_mid = max(3, gap // 2)
-        icon_px = max(10, min(22, cred_px_h + 4))
+        icon_px = _exif_strip_export_icon_px(cred_px_h)
         credit_h = _exif_footer_reserved_height(
             d0, font_cred, cred_sw, gap, icon_px
         )
@@ -2277,9 +2808,9 @@ def _compose_image_with_exif_strip(
             + credit_h
         )
         bar_h = pad * 2 + bar_inner
-        if bar_h <= bh_cap or font_px_h <= 9:
+        if bar_h <= bh_cap or font_px_h <= 8:
             break
-        font_px_h = max(9, font_px_h - 2)
+        font_px_h = max(8, font_px_h - 2)
 
     nx_eff, ny_eff = _export_map_strip_norms_to_image(
         w,
@@ -2303,7 +2834,7 @@ def _compose_image_with_exif_strip(
     col_gap = max(10, strip_w // 56)
     col_inner_w = max(40, (strip_w - pad * 3 - col_gap) // 2)
     lw, vw = _exif_row_label_value_widths(col_inner_w, spacing)
-    cred_px_h = max(9, font_px_h - 7)
+    cred_px_h = _exif_strip_export_cred_px(font_px_h)
     font_l, font_v, font_cred = _pillow_exif_strip_fonts(font_px_h, cred_px_h)
     stroke_w = _pillow_exif_stroke_width(font_px_h)
     sw_l = stroke_w
@@ -2326,7 +2857,7 @@ def _compose_image_with_exif_strip(
     x_right = mid + col_gap // 2
     yl = yr = sy + pad
     gap_mid = max(3, gap // 2)
-    icon_px = max(10, min(22, cred_px_h + 4))
+    icon_px = _exif_strip_export_icon_px(cred_px_h)
     credit_h_draw = _exif_footer_reserved_height(
         d0, font_cred, cred_sw, gap, icon_px
     )
@@ -2409,6 +2940,660 @@ def _compose_image_with_exif_strip(
         icon_px=icon_px,
     )
     return out
+
+
+_flet_pyproject_footer_cache: tuple[str, str] | None = None
+
+
+def _flet_pyproject_footer_lines() -> tuple[str, str]:
+    """Nome do produto e copyright de ``[tool.flet]`` no pyproject.toml (linhas como artifact + copyright)."""
+    global _flet_pyproject_footer_cache
+    if _flet_pyproject_footer_cache is not None:
+        return _flet_pyproject_footer_cache
+    default_a = "Ed Image Preview"
+    default_c = "Copyright (c) 2026 Edimar Barbosa. All rights reserved."
+    pp = Path(__file__).resolve().parent / "pyproject.toml"
+    artifact, copyright_s = default_a, default_c
+    if pp.is_file():
+        try:
+            raw = pp.read_text(encoding="utf-8")
+        except OSError:
+            raw = ""
+        if raw:
+            parsed = False
+            if sys.version_info >= (3, 11):
+                try:
+                    import tomllib
+
+                    data = tomllib.loads(raw)
+                    flet = (data.get("tool") or {}).get("flet") or {}
+                    a = str(flet.get("artifact") or flet.get("product") or "").strip()
+                    c = str(flet.get("copyright") or "").strip()
+                    if a:
+                        artifact = a
+                    if c:
+                        copyright_s = c
+                    parsed = True
+                except Exception:
+                    parsed = False
+            if not parsed:
+
+                def _toml_quoted(m: re.Match[str] | None) -> str:
+                    s = (m.group(1) if m else "") or ""
+                    return s.replace('\\"', '"').strip()
+
+                ma = re.search(r'(?m)^\s*artifact\s*=\s*"((?:[^"\\]|\\.)*)"', raw)
+                mp = re.search(r'(?m)^\s*product\s*=\s*"((?:[^"\\]|\\.)*)"', raw)
+                mc = re.search(r'(?m)^\s*copyright\s*=\s*"((?:[^"\\]|\\.)*)"', raw)
+                art = _toml_quoted(ma) or _toml_quoted(mp)
+                cop = _toml_quoted(mc)
+                if art:
+                    artifact = art
+                if cop:
+                    copyright_s = cop
+    _flet_pyproject_footer_cache = (artifact, copyright_s)
+    return _flet_pyproject_footer_cache
+
+
+def _blur_dup_export_footer_block_height(
+    font_px: int, w: int, h: int, _box_w: int
+) -> int:
+    """Altura reservada abaixo do bloco EXIF: rodapé com produto + copyright (fontes pequenas)."""
+    from PIL import Image, ImageDraw
+
+    title_px = max(6, int(round(font_px * 0.30)))
+    copy_px = max(6, title_px - 2)
+    _, font_title, font_copy = _pillow_exif_strip_fonts(title_px, copy_px)
+    art, cop = _flet_pyproject_footer_lines()
+    sw_t = _pillow_exif_stroke_width(title_px)
+    sw_c = _pillow_exif_stroke_width(copy_px)
+    scratch = Image.new("RGB", (max(w, 4), max(h, 4)), (0, 0, 0))
+    d0 = ImageDraw.Draw(scratch)
+    margin_lr = max(8, int(round(w * 0.10)))
+    max_tw = max(24, w - 2 * margin_lr)
+
+    def fit(s: str, font: object, sw: int) -> str:
+        t = s
+        for _ in range(240):
+            bb = d0.textbbox((0, 0), t, font=font, stroke_width=sw)
+            if bb[2] - bb[0] <= max_tw or len(t) <= 1:
+                return t
+            t = (t[:-2] + "…") if len(t) > 1 else "…"
+        return t
+
+    t1 = fit(art, font_title, sw_t)
+    t2 = fit(cop, font_copy, sw_c)
+    bb1 = d0.textbbox((0, 0), t1, font=font_title, stroke_width=sw_t)
+    bb2 = d0.textbbox((0, 0), t2, font=font_copy, stroke_width=sw_c)
+    h1 = bb1[3] - bb1[1]
+    h2 = bb2[3] - bb2[1]
+    gap = max(2, copy_px // 4)
+    edge_ref = max(6, min(font_px // 2, h // 24))
+    pad_bottom_eff = max(max(6, title_px // 2), edge_ref)
+    gap_top = max(4, font_px // 4)
+    return gap_top + h1 + gap + h2 + pad_bottom_eff
+
+
+def _blur_dup_export_measure_block(
+    merged: dict[str, object],
+    w: int,
+    h: int,
+    font_px: int,
+    *,
+    box_w: int,
+    box_h: int,
+) -> tuple[int, int]:
+    """Devolve (largura, altura) do bloco de texto para um dado ``font_px`` (área útil limitada a box)."""
+    from PIL import Image, ImageDraw
+
+    font_px = _blur_dup_export_body_font_px(font_px)
+    rows: list[str | None] = [
+        _exif_blur_dup_aperture_text(merged),
+        _exif_blur_dup_speed_text(merged),
+        _exif_blur_dup_iso_text(merged),
+        _exif_blur_dup_zoom_text(merged),
+        None,
+        _exif_blur_dup_camera_text(merged, for_export=True),
+        _exif_blur_dup_lens_text(merged, for_export=True),
+        _exif_blur_dup_author_text(merged),
+    ]
+    cred_px = _exif_strip_export_cred_px(font_px)
+    _fl, font_v, _fc = _pillow_exif_strip_fonts(font_px, cred_px)
+    sw = _pillow_exif_stroke_width(font_px)
+    ratio = font_px / float(BLUR_DUP_UI_TEXT_PT)
+    icon_s = int(
+        round(BLUR_DUP_UI_ICON_PT * ratio * BLUR_DUP_EXPORT_ICON_SCALE)
+    )
+    icon_s = max(BLUR_DUP_EXPORT_ICON_PX_MIN, min(BLUR_DUP_EXPORT_ICON_PX_MAX, icon_s))
+    gap_tx = max(6, int(round(10 * ratio)))
+    line_gap = max(5, int(round(8 * ratio)))
+    row_h = max(icon_s + 2, font_px + 7)
+    gap_block = int(round(row_h * 0.58))
+    margin_left = max(8, int(round(w * 0.10)))
+    max_text_px = max(20, box_w - margin_left - icon_s - gap_tx - 4)
+
+    scratch = Image.new("RGB", (max(w, 4), max(h, 4)), (0, 0, 0))
+    d0 = ImageDraw.Draw(scratch)
+    max_row_w = 0
+
+    for txt in rows:
+        if txt is None:
+            continue
+        tvis = _exif_value_short(txt, max(6, max_text_px // max(3, font_px // 4)))
+        for _ in range(160):
+            bb = d0.textbbox((0, 0), tvis, font=font_v, stroke_width=sw)
+            tw = bb[2] - bb[0]
+            if tw <= max_text_px or len(tvis) <= 1:
+                break
+            tvis = (tvis[:-2] + "…") if len(tvis) > 1 else "…"
+        bb = d0.textbbox((0, 0), tvis, font=font_v, stroke_width=sw)
+        tw_line = bb[2] - bb[0]
+        row_w = margin_left + icon_s + gap_tx + tw_line
+        max_row_w = max(max_row_w, row_w)
+
+    n_text = sum(1 for r in rows if r is not None)
+    block_h = n_text * (row_h + line_gap) + gap_block - line_gap
+    fh = _blur_dup_export_footer_block_height(font_px, w, h, box_w)
+    block_h = min(block_h, max(1, box_h - fh))
+    return max_row_w, block_h + fh
+
+
+def _blur_dup_export_pick_font_for_area_frac(
+    merged: dict[str, object],
+    w: int,
+    h: int,
+    *,
+    area_frac: float = BLUR_DUP_EXPORT_AREA_FRAC,
+) -> int:
+    """Maior ``font_px`` tal que o bloco EXIF caiba no rectângulo área_frac×largura × área_frac×altura."""
+    box_w = max(40, int(w * area_frac))
+    box_h = max(40, int(h * area_frac))
+    lo, hi = 10, min(400, max(int(h * 0.45), int(w * 0.25)))
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            bw, bh = _blur_dup_export_measure_block(
+                merged, w, h, mid, box_w=box_w, box_h=box_h
+            )
+        except Exception:
+            bw, bh = box_w + 1, box_h + 1
+        if bw <= box_w + 2 and bh <= box_h + 2:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return max(8, best)
+
+
+_aperture_export_rgb_loaded: bool = False
+_aperture_export_rgb: object | None = None  # Image.Image após carregar com sucesso
+
+
+def _blur_dup_aperture_export_source_rgb():
+    """RGB do ``assets/aperture_export.png`` (cache em memória)."""
+    global _aperture_export_rgb_loaded, _aperture_export_rgb
+    if _aperture_export_rgb_loaded:
+        return _aperture_export_rgb  # type: ignore[return-value]
+    from PIL import Image
+
+    _aperture_export_rgb_loaded = True
+    p = APERTURE_EXPORT_ICON_PATH
+    if not p.is_file():
+        _aperture_export_rgb = None
+        return None
+    try:
+        with Image.open(_local_path_for_read(str(p))) as im0:
+            _aperture_export_rgb = im0.convert("RGB").copy()
+    except Exception:
+        _aperture_export_rgb = None
+        return None
+    return _aperture_export_rgb  # type: ignore[return-value]
+
+
+def _pillow_blur_dup_paste_aperture_export_icon(
+    target: object,
+    x: int,
+    y: int,
+    s: int,
+    _fg: tuple[int, int, int],
+) -> bool:
+    """Cola o PNG do diafragma em ``target`` (RGB): silhueta toda branca (máscara por luminância)."""
+    from PIL import Image
+
+    src = _blur_dup_aperture_export_source_rgb()
+    if src is None or s < 8:
+        return False
+    im = src.resize((s, s), Image.Resampling.LANCZOS)
+    lum = im.convert("L")
+
+    def alpha_from_l(L: int) -> int:
+        if L < 10:
+            return 0
+        if L < 38:
+            return min(255, (L - 10) * 6)
+        return min(255, 168 + L // 2)
+
+    alpha = lum.point(alpha_from_l)
+    out = Image.new("RGBA", im.size, (255, 255, 255, 0))
+    out.putalpha(alpha)
+    target.paste(out, (x, y), out)
+    return True
+
+
+# Ordem alinhada com ``rows`` em ``_pillow_blur_dup_export_overlay_on_rgb`` (None = separador).
+_BLUR_DUP_EXPORT_ROW_KINDS: tuple[str | None, ...] = (
+    "aperture",
+    "shutter",
+    "iso",
+    "zoom",
+    None,
+    "camera",
+    "lens",
+    "person",
+)
+
+
+def _pillow_blur_dup_draw_export_icon(
+    draw,
+    kind: str,
+    x: int,
+    y: int,
+    s: int,
+    col: tuple[int, int, int],
+    *,
+    target_rgb: object | None = None,
+) -> None:
+    """Ícones na exportação: abertura (PNG); speed/ângulo/câmara/lente/utilizador sólidos brancos; ISO híbrido."""
+    p = max(1, s // 8)
+    x1, y1 = x + p, y + p
+    x2, y2 = x + s - p, y + s - p
+    w0, h0 = max(2, x2 - x1), max(2, y2 - y1)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    lw = max(1, min(3, s // 7))
+    wht = (255, 255, 255)
+
+    if kind == "aperture":
+        if target_rgb is not None and _pillow_blur_dup_paste_aperture_export_icon(
+            target_rgb, x, y, s, col
+        ):
+            return
+        # Fallback se o PNG não existir: íris estilizada (7 lâminas), toda branca.
+        rm = min(w0, h0) * 0.5
+        ro = rm * 0.94
+        draw.ellipse(
+            (cx - int(ro), cy - int(ro), cx + int(ro), cy + int(ro)),
+            outline=wht,
+            width=max(1, lw),
+        )
+        ri = rm * 0.78
+        draw.ellipse(
+            (cx - int(ri), cy - int(ri), cx + int(ri), cy + int(ri)),
+            outline=wht,
+            width=max(1, max(1, lw - 1)),
+        )
+        n_blades = 7
+        r_mean = rm * 0.34
+        wav = 0.17
+        npts = max(28, n_blades * 8)
+        pts: list[tuple[int, int]] = []
+        for k in range(npts + 1):
+            th = (2 * math.pi * k) / npts - math.pi / 2
+            rr = r_mean * (1 + wav * math.cos(n_blades * th))
+            pts.append(
+                (
+                    int(round(cx + rr * math.cos(th))),
+                    int(round(cy + rr * math.sin(th))),
+                )
+            )
+        wpoly = max(2, lw)
+        draw.polygon(pts, outline=wht, width=wpoly)
+    elif kind == "shutter":
+        # Despertador sólido branco: sinos, patas, mostrador.
+        pad = max(2, s // 10)
+        fx1, fy1 = x1 + pad, y1 + pad + s // 10
+        fx2, fy2 = x2 - pad, y2 - pad
+        rr = min(fx2 - fx1, fy2 - fy1) // 2
+        fcx = (fx1 + fx2) // 2
+        fcy = (fy1 + fy2) // 2
+        br = max(2, rr // 4)
+        bx = int(rr * 0.72)
+        draw.ellipse(
+            (fcx - bx - br, fy1 - br * 2, fcx - bx + br, fy1),
+            fill=wht,
+            outline=wht,
+            width=max(1, lw),
+        )
+        draw.ellipse(
+            (fcx + bx - br, fy1 - br * 2, fcx + bx + br, fy1),
+            fill=wht,
+            outline=wht,
+            width=max(1, lw),
+        )
+        wleg = max(2, lw)
+        draw.line((fcx - bx, fy1 - br, fcx - rr, fcy - rr), fill=wht, width=max(1, lw))
+        draw.line((fcx + bx, fy1 - br, fcx + rr, fcy - rr), fill=wht, width=max(1, lw))
+        leg = max(2, rr // 3)
+        draw.line(
+            (fcx - rr // 2, fcy + rr, fcx - rr // 2 - leg, fcy + rr + leg),
+            fill=wht,
+            width=wleg,
+        )
+        draw.line(
+            (fcx + rr // 2, fcy + rr, fcx + rr // 2 + leg, fcy + rr + leg),
+            fill=wht,
+            width=wleg,
+        )
+        draw.ellipse(
+            (fcx - rr, fcy - rr, fcx + rr, fcy + rr),
+            fill=wht,
+            outline=wht,
+            width=max(1, lw),
+        )
+        hw = max(2, lw)
+        draw.line(
+            (fcx, fcy, fcx + int(rr * 0.35), fcy - int(rr * 0.2)),
+            fill=wht,
+            width=hw,
+        )
+        draw.line(
+            (fcx, fcy, fcx - int(rr * 0.15), fcy - int(rr * 0.42)),
+            fill=wht,
+            width=hw,
+        )
+        draw.ellipse((fcx - 2, fcy - 2, fcx + 2, fcy + 2), fill=wht, outline=wht, width=1)
+    elif kind == "iso":
+        # Círculo: metade preenchida (branco), metade só contorno (Pillow: arco no sentido horário).
+        box = (x1, y1, x2, y2)
+        white = (255, 255, 255)
+        draw.pieslice(box, start=90, end=270, fill=white, outline=col, width=lw)
+        draw.arc(box, start=270, end=630, fill=col, width=lw)
+    elif kind == "zoom":
+        # Ângulo aberto à direita: cunha triangular branca preenchida.
+        ax = x1 + max(2, w0 // 8)
+        ay = cy
+        spread = math.radians(52)
+        half = spread * 0.5
+        L = min(w0, h0) * 0.78
+        x_far = ax + int(L * math.cos(half))
+        yU = ay - int(L * math.sin(half))
+        yD = ay + int(L * math.sin(half))
+        wedge = [(ax, ay), (x_far, yU), (x_far, yD)]
+        draw.polygon(wedge, fill=wht, outline=wht)
+    elif kind == "camera":
+        # Corpo + espelho + objetiva, tudo branco preenchido.
+        body = (x1 + w0 // 10, y1 + h0 // 4, x2 - w0 // 12, y2 - h0 // 10)
+        rad = max(2, s // 9)
+        draw.rounded_rectangle(body, radius=rad, fill=wht, outline=wht, width=max(1, lw))
+        bw = body[2] - body[0]
+        bh = body[3] - body[1]
+        hx = body[0] + bw // 4
+        hy = body[1] - bh // 4
+        draw.rounded_rectangle(
+            (hx, hy, hx + bw // 2, body[1] + bh // 6),
+            radius=max(1, rad // 2),
+            fill=wht,
+            outline=wht,
+            width=max(1, lw),
+        )
+        lr = min(w0, h0) // 5
+        lx = body[2] - bw // 4
+        ly = (body[1] + body[3]) // 2
+        draw.ellipse((lx - lr, ly - lr, lx + lr, ly + lr), fill=wht, outline=wht, width=max(1, lw))
+        ir = int(lr * 0.45)
+        draw.ellipse((lx - ir, ly - ir, lx + ir, ly + ir), fill=wht, outline=wht, width=max(1, lw))
+    elif kind == "lens":
+        # Objetiva em perfil: tubo + elemento frontal, branco preenchido.
+        mid = (y1 + y2) // 2
+        hbar = max(3, h0 // 3)
+        yb1, yb2 = mid - hbar // 2, mid + hbar // 2
+        xb1 = x1 + w0 // 5
+        xb2 = x2 - w0 // 8
+        rbar = max(2, hbar // 5)
+        draw.rounded_rectangle(
+            (xb1, yb1, xb2, yb2), radius=rbar, fill=wht, outline=wht, width=max(1, lw)
+        )
+        gr = (yb2 - yb1) // 2 + max(1, lw)
+        gx2 = x1 + w0 // 5 + gr + lw
+        draw.ellipse((x1 + p, mid - gr, gx2, mid + gr), fill=wht, outline=wht, width=max(1, lw))
+    elif kind == "person":
+        # Silhueta utilizador: cabeça + tronco (trapézio) brancos preenchidos.
+        rh = max(3, h0 // 5)
+        head_t = y1 + p
+        head_b = head_t + 2 * rh
+        draw.ellipse((cx - rh, head_t, cx + rh, head_b), fill=wht, outline=wht, width=max(1, lw))
+        wb = max(rh + 2, int(rh * 1.35))
+        yb = y2 - p
+        draw.polygon(
+            [
+                (cx - wb, head_b),
+                (cx + wb, head_b),
+                (cx + wb + rh // 3, yb),
+                (cx - wb - rh // 3, yb),
+            ],
+            fill=wht,
+            outline=wht,
+        )
+    else:
+        rr = max(2, s // 5)
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=rr, outline=col, width=lw)
+
+
+def _pillow_blur_dup_export_overlay_on_rgb(
+    rgb_blurred,
+    merged: dict[str, object],
+    *,
+    viewport_pw: int | None = None,
+    viewport_ph: int | None = None,
+):
+    """Painel direito na exportação: véu escuro + linhas EXIF; escala ~75% da área útil do painel."""
+    from PIL import Image, ImageDraw
+
+    _ = (viewport_pw, viewport_ph)  # reservado; layout com margens e alinhamento à esquerda.
+    w, h = rgb_blurred.size
+    base = rgb_blurred.convert("RGBA")
+    veil = Image.new("RGBA", (w, h), (0, 0, 0, int(255 * 0.38)))
+    base = Image.alpha_composite(base, veil)
+    out = base.convert("RGB")
+    draw = ImageDraw.Draw(out)
+    rows: list[str | None] = [
+        _exif_blur_dup_aperture_text(merged),
+        _exif_blur_dup_speed_text(merged),
+        _exif_blur_dup_iso_text(merged),
+        _exif_blur_dup_zoom_text(merged),
+        None,
+        _exif_blur_dup_camera_text(merged, for_export=True),
+        _exif_blur_dup_lens_text(merged, for_export=True),
+        _exif_blur_dup_author_text(merged),
+    ]
+    # Bloco limitado a BLUR_DUP_EXPORT_AREA_FRAC da largura e da altura do painel.
+    area_frac = BLUR_DUP_EXPORT_AREA_FRAC
+    box_w = max(40, int(w * area_frac))
+    box_h = max(40, int(h * area_frac))
+    picked = _blur_dup_export_pick_font_for_area_frac(merged, w, h, area_frac=area_frac)
+    font_px = max(
+        6,
+        int(
+            round(
+                float(_blur_dup_export_body_font_px(picked))
+                * float(BLUR_DUP_EXPORT_PANEL_FONT_SCALE)
+            )
+        ),
+    )
+    cred_px = _exif_strip_export_cred_px(font_px)
+    _fl, font_v, _fc = _pillow_exif_strip_fonts(font_px, cred_px)
+    sw = _pillow_exif_stroke_width(font_px)
+    stroke_fill = (18, 20, 28)
+    fg = (245, 248, 255)
+    ratio = font_px / float(BLUR_DUP_UI_TEXT_PT)
+    icon_s = int(
+        round(BLUR_DUP_UI_ICON_PT * ratio * BLUR_DUP_EXPORT_ICON_SCALE)
+    )
+    icon_s = max(BLUR_DUP_EXPORT_ICON_PX_MIN, min(BLUR_DUP_EXPORT_ICON_PX_MAX, icon_s))
+    gap_tx = max(6, int(round(10 * ratio)))
+    line_gap = max(5, int(round(8 * ratio)))
+    row_h = max(icon_s + 2, font_px + 7)
+    gap_block = int(round(row_h * 0.58))
+    margin_left = max(8, int(round(w * 0.10)))
+    edge_v = max(6, min(font_px // 2, h // 24))
+    max_text_px = max(20, box_w - margin_left - icon_s - gap_tx - 4)
+
+    fh = _blur_dup_export_footer_block_height(font_px, w, h, box_w)
+    n_text = sum(1 for r in rows if r is not None)
+    block_h_raw = n_text * (row_h + line_gap) + gap_block - line_gap
+    block_h = min(block_h_raw, max(1, box_h - fh))
+    y_max_exif_bottom = h - edge_v - fh
+    block_h = min(block_h, max(1, y_max_exif_bottom - edge_v))
+    # Centrado na faixa acima do rodapé (produto + copyright do pyproject).
+    y = edge_v + max(0, (y_max_exif_bottom - edge_v - block_h) // 2)
+    if y + block_h > y_max_exif_bottom:
+        y = max(edge_v, y_max_exif_bottom - block_h)
+
+    for kind, txt in zip(_BLUR_DUP_EXPORT_ROW_KINDS, rows):
+        if txt is None:
+            y += gap_block
+            continue
+        tvis = _exif_value_short(
+            txt, max(8, max_text_px // max(4, font_px // 3))
+        )
+        for _ in range(120):
+            bb = draw.textbbox((0, 0), tvis, font=font_v, stroke_width=sw)
+            tw = bb[2] - bb[0]
+            if tw <= max_text_px or len(tvis) <= 1:
+                break
+            tvis = (tvis[:-2] + "…") if len(tvis) > 1 else "…"
+        bb = draw.textbbox((0, 0), tvis, font=font_v, stroke_width=sw)
+        x0 = margin_left
+
+        _pillow_blur_dup_draw_export_icon(
+            draw, kind, x0, y, icon_s, fg, target_rgb=out
+        )
+        tx = x0 + icon_s + gap_tx
+        th = bb[3] - bb[1]
+        y_text = y + max(0, (icon_s - th) // 2)
+        draw.text(
+            (tx, y_text),
+            tvis,
+            font=font_v,
+            fill=fg,
+            stroke_width=sw,
+            stroke_fill=stroke_fill,
+        )
+        y += row_h + line_gap
+
+    title_px = max(6, int(round(font_px * 0.30)))
+    copy_px = max(6, title_px - 2)
+    _, font_ft, font_fc = _pillow_exif_strip_fonts(title_px, copy_px)
+    sw_t = _pillow_exif_stroke_width(title_px)
+    sw_c = _pillow_exif_stroke_width(copy_px)
+    art, cop = _flet_pyproject_footer_lines()
+    margin_right = margin_left
+    max_tw_f = max(24, w - margin_left - margin_right)
+
+    def _foot_fit(s: str, font: object, sw: int) -> str:
+        t = s
+        for _ in range(240):
+            bb = draw.textbbox((0, 0), t, font=font, stroke_width=sw)
+            if bb[2] - bb[0] <= max_tw_f or len(t) <= 1:
+                return t
+            t = (t[:-2] + "…") if len(t) > 1 else "…"
+        return t
+
+    t1 = _foot_fit(art, font_ft, sw_t)
+    t2 = _foot_fit(cop, font_fc, sw_c)
+    bb1 = draw.textbbox((0, 0), t1, font=font_ft, stroke_width=sw_t)
+    bb2 = draw.textbbox((0, 0), t2, font=font_fc, stroke_width=sw_c)
+    h1 = bb1[3] - bb1[1]
+    h2 = bb2[3] - bb2[1]
+    gap_f = max(2, copy_px // 4)
+    pad_bottom_eff = max(max(6, title_px // 2), edge_v)
+    y2 = h - pad_bottom_eff - h2
+    draw.text(
+        (margin_left, y2),
+        t2,
+        font=font_fc,
+        fill=fg,
+        stroke_width=sw_c,
+        stroke_fill=stroke_fill,
+    )
+    y1 = y2 - gap_f - h1
+    draw.text(
+        (margin_left, y1),
+        t1,
+        font=font_ft,
+        fill=fg,
+        stroke_width=sw_t,
+        stroke_fill=stroke_fill,
+    )
+    return out
+
+
+def _compose_export_with_blur_side_panel(
+    image_path: str,
+    merged: dict[str, object],
+    exif_filter: ExifDisplayFilter,
+    *,
+    draw_exif_strip: bool = True,
+    **kwargs: object,
+):
+    """Largura 2×: esquerda = export normal com tarja; direita = cópia borrada + dados EXIF do painel."""
+    from PIL import Image
+
+    left = _compose_image_with_exif_strip(
+        image_path,
+        merged,
+        exif_filter,
+        draw_exif_strip=draw_exif_strip,
+        **kwargs,
+    )
+    w, h = left.size
+    local = _local_path_for_read(image_path)
+    with Image.open(local) as im0:
+        raw = im0.convert("RGB")
+    if raw.size != (w, h):
+        raw = raw.resize((w, h), Image.Resampling.LANCZOS)
+    blurred = _pillow_rgb_heavily_blurred(raw)
+    if blurred.size != (w, h):
+        blurred = blurred.resize((w, h), Image.Resampling.LANCZOS)
+    vpw = kwargs.get("viewport_pw")
+    vph = kwargs.get("viewport_ph")
+    right = _pillow_blur_dup_export_overlay_on_rgb(
+        blurred,
+        merged,
+        viewport_pw=int(vpw) if vpw is not None else None,
+        viewport_ph=int(vph) if vph is not None else None,
+    )
+    out = Image.new("RGB", (w * 2, h))
+    out.paste(left, (0, 0))
+    out.paste(right, (w, 0))
+    return out
+
+
+def _compose_strip_export_image(
+    image_path: str,
+    merged: dict[str, object],
+    exif_filter: ExifDisplayFilter,
+    *,
+    export_kw: dict[str, object],
+    blur_dup_side: bool,
+    draw_exif_strip: bool = True,
+):
+    """Exportação: tarja só se ``draw_exif_strip``; painel borrado se ``blur_dup_side`` (como no ecrã)."""
+    if blur_dup_side:
+        return _compose_export_with_blur_side_panel(
+            image_path,
+            merged,
+            exif_filter,
+            draw_exif_strip=draw_exif_strip,
+            **export_kw,
+        )
+    return _compose_image_with_exif_strip(
+        image_path,
+        merged,
+        exif_filter,
+        draw_exif_strip=draw_exif_strip,
+        **export_kw,
+    )
 
 
 def _orientation_label(val: object) -> str | None:
@@ -2623,17 +3808,38 @@ def _pil_image_rgb_for_pdf(path: str):
     return im
 
 
-def _write_gallery_pdf(paths: list[str], dest: Path) -> tuple[int, int]:
-    """Grava um PDF multi-página. Devolve (páginas escritas, ficheiros ignorados)."""
+def _write_gallery_pdf(
+    paths: list[str],
+    dest: Path,
+    merges: list[dict[str, object]],
+    filt: ExifDisplayFilter,
+    draw_strip: bool,
+    blur_dup: bool,
+    export_kw_list: list[dict[str, object]],
+) -> tuple[int, int]:
+    """Grava um PDF multi-página (mesma composição que «Guardar com tarja»). Devolve (páginas, ignorados)."""
     pages: list = []
     skipped = 0
-    for p in paths:
+    for i, p in enumerate(paths):
         try:
             fs = _local_path_for_read(p)
             if not Path(fs).is_file():
                 skipped += 1
                 continue
-            pages.append(_pil_image_rgb_for_pdf(p))
+            if _load_merged_exif_from_path(p) is None:
+                pages.append(_pil_image_rgb_for_pdf(p))
+                continue
+            merged = merges[i] if i < len(merges) else {}
+            kw = export_kw_list[i] if i < len(export_kw_list) else {}
+            im = _compose_strip_export_image(
+                str(p),
+                merged,
+                filt,
+                export_kw=dict(kw),
+                blur_dup_side=blur_dup,
+                draw_exif_strip=draw_strip,
+            )
+            pages.append(im)
         except Exception:
             skipped += 1
     if not pages:
@@ -2979,6 +4185,14 @@ def main(page: ft.Page) -> None:
     exif_bar_refs: list[ft.Container] = []
     slide_merges: list[dict[str, object]] = []
     exif_strip_wrap_refs: list[ft.Container] = []
+    blur_dup_right_refs: list[ft.Container] = []
+    blur_dup_layout_refs: list[tuple[ft.Container, ft.Container]] = []
+    blur_dup_exif_box_refs: list[ft.Container] = []
+    blur_dup_strip_nx: list[float] = []
+    blur_dup_strip_ny: list[float] = []
+    blur_dup_strip_w_frac: list[float] = []
+    _blur_dup_strip_drag_prev: list[tuple[float, float] | None] = [None]
+    _blur_dup_strip_resize_prev: list[tuple[float, float] | None] = [None]
     exif_strip_nx: float = 0.5
     exif_strip_ny: float = 1.0
     exif_strip_w_frac: float = EXIF_STRIP_WIDTH_FRAC
@@ -3001,6 +4215,7 @@ def main(page: ft.Page) -> None:
     exif_sw_location = ft.Switch(value=False, **_sw_compact)
     exif_sw_other = ft.Switch(value=True, **_sw_compact)
     exif_show_strip = ft.Switch(value=True, **_sw_compact)
+    blur_dup_sw = ft.Switch(value=False, **_sw_compact)
 
     def _toggle_row(label: str, sw: ft.Switch) -> ft.Row:
         return ft.Row(
@@ -3105,6 +4320,12 @@ def main(page: ft.Page) -> None:
         for c in exif_bar_refs:
             c.bgcolor = ft.Colors.with_opacity(op, ft.Colors.BLACK)
 
+    def _apply_blur_dup_strip_opacity() -> None:
+        """Tarjas EXIF do painel borrado: mesma opacidade que o slider da tarja principal."""
+        op = max(0.12, min(1.0, float(exif_strip_opacity)))
+        for bx in blur_dup_exif_box_refs:
+            bx.bgcolor = ft.Colors.with_opacity(op, EXIF_STRIP_PANEL_HEX)
+
     def _refresh_exif_bars() -> None:
         if not exif_bar_refs or len(exif_bar_refs) != len(slide_merges):
             return
@@ -3145,6 +4366,119 @@ def main(page: ft.Page) -> None:
         _refresh_exif_bars()
 
     exif_show_strip.on_change = _on_exif_strip_toggle
+
+    def _blur_dup_strip_inner_metrics(
+        ix: int,
+    ) -> tuple[float, float, float, float, float, float, float] | None:
+        """(margin_l, usable_w, dh, sw, sh, free_x, free_y) ou None."""
+        if ix < 0 or ix >= len(blur_dup_layout_refs):
+            return None
+        _ot, _so = blur_dup_layout_refs[ix]
+        dw = int(_ot.width or 0)
+        dh = int(_ot.height or 0)
+        if dw < 40 or dh < 40:
+            return None
+        margin_l = float(max(8, int(round(dw * 0.10))))
+        usable_w = float(dw) - margin_l - 8.0
+        if usable_w < 50.0:
+            return None
+        wf = max(
+            EXIF_STRIP_W_FRAC_MIN,
+            min(EXIF_STRIP_W_FRAC_MAX, float(blur_dup_strip_w_frac[ix])),
+        )
+        sw = max(80.0, min(usable_w, usable_w * wf))
+        free_x = max(0.0, usable_w - sw)
+        sh = max(80.0, min(float(dh - 16), 280.0))
+        free_y = max(0.0, float(dh - 16) - sh)
+        return margin_l, usable_w, float(dh), sw, sh, free_x, free_y
+
+    def _layout_blur_dup_strip(ix: int) -> None:
+        if ix < 0 or ix >= len(blur_dup_layout_refs):
+            return
+        m = _blur_dup_strip_inner_metrics(ix)
+        if m is None:
+            return
+        margin_l, _usable_w, _dh, sw, sh, free_x, free_y = m
+        _ot, strip_outer = blur_dup_layout_refs[ix]
+        sx = margin_l + max(0.0, min(1.0, blur_dup_strip_nx[ix])) * free_x
+        sy = 8.0 + max(0.0, min(1.0, blur_dup_strip_ny[ix])) * free_y
+        strip_outer.left = int(round(sx))
+        strip_outer.top = int(round(sy))
+        strip_outer.width = max(1, int(round(sw)))
+        strip_outer.height = max(1, int(round(sh)))
+
+    def _apply_all_blur_dup_strip_layouts() -> None:
+        for j in range(len(blur_dup_layout_refs)):
+            _layout_blur_dup_strip(j)
+
+    def on_blur_dup_strip_pan_start(_: ft.DragStartEvent) -> None:
+        _blur_dup_strip_drag_prev[0] = None
+
+    def on_blur_dup_strip_pan_update(e: ft.DragUpdateEvent, ix: int) -> None:
+        gp = e.global_position
+        cur = (float(gp.x), float(gp.y))
+        prev = _blur_dup_strip_drag_prev[0]
+        if prev is None:
+            _blur_dup_strip_drag_prev[0] = cur
+            return
+        dx = cur[0] - prev[0]
+        dy = cur[1] - prev[1]
+        _blur_dup_strip_drag_prev[0] = cur
+        m = _blur_dup_strip_inner_metrics(ix)
+        if m is None:
+            return
+        _ml, _uw, _dh, _sw, _sh, free_x, free_y = m
+        denom_x = max(1.0, free_x)
+        denom_y = max(1.0, free_y)
+        blur_dup_strip_nx[ix] += dx / denom_x
+        blur_dup_strip_ny[ix] += dy / denom_y
+        blur_dup_strip_nx[ix] = max(0.0, min(1.0, blur_dup_strip_nx[ix]))
+        blur_dup_strip_ny[ix] = max(0.0, min(1.0, blur_dup_strip_ny[ix]))
+        _layout_blur_dup_strip(ix)
+        page.update()
+
+    def on_blur_dup_strip_pan_end(_: ft.DragEndEvent) -> None:
+        _blur_dup_strip_drag_prev[0] = None
+
+    def on_blur_dup_strip_resize_start(_: ft.DragStartEvent) -> None:
+        _blur_dup_strip_resize_prev[0] = None
+
+    def on_blur_dup_strip_resize_update(e: ft.DragUpdateEvent, ix: int) -> None:
+        gp = e.global_position
+        cur = (float(gp.x), float(gp.y))
+        prev = _blur_dup_strip_resize_prev[0]
+        if prev is None:
+            _blur_dup_strip_resize_prev[0] = cur
+            return
+        dx = cur[0] - prev[0]
+        _blur_dup_strip_resize_prev[0] = cur
+        m = _blur_dup_strip_inner_metrics(ix)
+        if m is None:
+            return
+        _ml, usable_w, _dh, _sw, _sh, _fx, _fy = m
+        blur_dup_strip_w_frac[ix] += dx / max(1.0, usable_w)
+        blur_dup_strip_w_frac[ix] = max(
+            EXIF_STRIP_W_FRAC_MIN,
+            min(EXIF_STRIP_W_FRAC_MAX, blur_dup_strip_w_frac[ix]),
+        )
+        _layout_blur_dup_strip(ix)
+        page.update()
+
+    def on_blur_dup_strip_resize_end(_: ft.DragEndEvent) -> None:
+        _blur_dup_strip_resize_prev[0] = None
+
+    def _sync_blur_dup_layout() -> None:
+        v = blur_dup_sw.value
+        for c in blur_dup_right_refs:
+            c.visible = v
+            c.expand = v
+            c.width = None if v else 0
+        _apply_exif_strip_positions()
+        _apply_all_blur_dup_strip_layouts()
+        page.update()
+
+    blur_dup_sw.on_change = lambda _: _sync_blur_dup_layout()
+
     for _sw in (
         exif_sw_make,
         exif_sw_model,
@@ -3164,10 +4498,15 @@ def main(page: ft.Page) -> None:
         ww = int(page.window.width or 1100)
         wh = int(page.window.height or 800)
         sw = SIDEBAR_W_EXPANDED if sidebar_open[0] else SIDEBAR_W_COLLAPSED
-        # Área útil da foto à direita (sem painel lateral nem margens).
-        pw = max(220, ww - 96 - sw)
-        # Barra EXIF/miniaturas passou para o painel esquerdo — mais altura para o slide.
-        ph = max(160, wh - 100)
+        # Largura útil do PageView: janela − barra lateral − botões prev/next (≈48px cada) − spacing Row.
+        nav_reserve = 112
+        pw = max(220, ww - sw - nav_reserve)
+        # Com painel desfocado ao lado, a foto nítida ocupa ~metade da largura do slide.
+        if blur_dup_sw.value:
+            pw = max(120, (pw - 2) // 2)
+        # Altura útil do slide (miniaturas no painel esquerdo): não subtrair ~100px como antigamente,
+        # senão o letterbox da tarja fica mais baixo que o Stack real e o texto desloca-se da imagem.
+        ph = max(160, wh - 40)
         return pw, ph
 
     def _apply_exif_strip_positions() -> None:
@@ -3337,6 +4676,7 @@ def main(page: ft.Page) -> None:
             return
         exif_strip_opacity = float(e.control.value)
         _apply_exif_bar_opacity()
+        _apply_blur_dup_strip_opacity()
         page.update()
 
     dd_exif_placement = ft.Dropdown(
@@ -3423,6 +4763,12 @@ def main(page: ft.Page) -> None:
         slide_merges.clear()
         exif_bar_refs.clear()
         exif_strip_wrap_refs.clear()
+        blur_dup_right_refs.clear()
+        blur_dup_layout_refs.clear()
+        blur_dup_exif_box_refs.clear()
+        blur_dup_strip_nx.clear()
+        blur_dup_strip_ny.clear()
+        blur_dup_strip_w_frac.clear()
         slide_dims.clear()
         thumb_selected.clear()
         thumb_select_btns.clear()
@@ -3463,6 +4809,9 @@ def main(page: ft.Page) -> None:
                     slide_dims.append(_imsz.size)
             except Exception:
                 slide_dims.append((1920, 1080))
+            blur_dup_strip_nx.append(0.0)
+            blur_dup_strip_ny.append(0.5)
+            blur_dup_strip_w_frac.append(float(EXIF_STRIP_WIDTH_FRAC))
             vert = _vertical_overlay_for_index(i)
             exif_overlay_slide = (
                 _exif_overlay_single_column_from_pairs(exif_pairs_slide)
@@ -3489,33 +4838,6 @@ def main(page: ft.Page) -> None:
                     )
                 page.update()
 
-            stack_controls: list[ft.Control] = [
-                ft.Container(
-                    expand=True,
-                    content=ft.InteractiveViewer(
-                        expand=True,
-                        min_scale=0.25,
-                        max_scale=6.0,
-                        boundary_margin=ft.Margin.all(0),
-                        clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                        constrained=True,
-                        content=ft.Image(
-                            src=img_display_src,
-                            fit=ft.BoxFit.CONTAIN,
-                            expand=True,
-                            filter_quality=ft.FilterQuality.MEDIUM,
-                        ),
-                    ),
-                ),
-            ]
-            if brand_slide is not None:
-                stack_controls.append(
-                    ft.Container(
-                        top=12,
-                        left=12,
-                        content=brand_slide,
-                    )
-                )
             exif_box = ft.Container(
                 padding=ft.Padding.symmetric(horizontal=14, vertical=11),
                 bgcolor=ft.Colors.with_opacity(
@@ -3581,7 +4903,91 @@ def main(page: ft.Page) -> None:
             )
             exif_bar_refs.append(exif_box)
             exif_strip_wrap_refs.append(exif_outer)
-            stack_controls.append(exif_outer)
+
+            main_image_area = ft.Container(
+                expand=True,
+                content=ft.InteractiveViewer(
+                    expand=True,
+                    min_scale=0.25,
+                    max_scale=6.0,
+                    boundary_margin=ft.Margin.all(0),
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                    constrained=True,
+                    content=ft.Image(
+                        src=img_display_src,
+                        fit=ft.BoxFit.CONTAIN,
+                        expand=True,
+                        filter_quality=ft.FilterQuality.MEDIUM,
+                    ),
+                ),
+            )
+            left_stack_controls: list[ft.Control] = [main_image_area]
+            if brand_slide is not None:
+                left_stack_controls.append(
+                    ft.Container(
+                        top=12,
+                        left=12,
+                        content=brand_slide,
+                    )
+                )
+            left_stack_controls.append(exif_outer)
+            left_stack = ft.Stack(
+                expand=True,
+                fit=ft.StackFit.EXPAND,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                controls=left_stack_controls,
+            )
+            blur_panel_src = img_display_src
+            blur_apply_ui = True
+            try:
+                local_blur = _local_path_for_read(src_str)
+                if Path(local_blur).is_file():
+                    fd_b, blur_tmp = tempfile.mkstemp(prefix="edblur_", suffix=".png")
+                    os.close(fd_b)
+                    if _pillow_write_heavily_blurred_duplicate(local_blur, blur_tmp):
+                        blur_panel_src = _flet_image_display_src(blur_tmp)
+                        _picker_temp_paths.append(blur_tmp)
+                        blur_apply_ui = False
+                    else:
+                        try:
+                            os.unlink(blur_tmp)
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+            tw_img, th_img = slide_dims[i]
+            right_blur = _build_blur_duplicate_slide_panel(
+                blur_panel_src,
+                m_for_pairs,
+                apply_ui_blur=blur_apply_ui,
+                image_width=tw_img,
+                image_height=th_img,
+                slide_index=i,
+                blur_dup_layout_refs=blur_dup_layout_refs,
+                blur_exif_box_refs=blur_dup_exif_box_refs,
+                strip_opacity=exif_strip_opacity,
+                blur_pan_start=on_blur_dup_strip_pan_start,
+                blur_pan_update=on_blur_dup_strip_pan_update,
+                blur_pan_end=on_blur_dup_strip_pan_end,
+                blur_resize_start=on_blur_dup_strip_resize_start,
+                blur_resize_update=on_blur_dup_strip_resize_update,
+                blur_resize_end=on_blur_dup_strip_resize_end,
+                blur_layout_strip_ix=_layout_blur_dup_strip,
+            )
+            blur_dup_right_refs.append(right_blur)
+            _bdv = blur_dup_sw.value
+            right_blur.visible = bool(_bdv)
+            right_blur.expand = bool(_bdv)
+            right_blur.width = None if _bdv else 0
+            slide_row = ft.Row(
+                expand=True,
+                spacing=2,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                controls=[
+                    ft.Container(expand=True, content=left_stack),
+                    right_blur,
+                ],
+            )
 
             page_view.controls.append(
                 ft.Container(
@@ -3589,12 +4995,7 @@ def main(page: ft.Page) -> None:
                     clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                     alignment=ft.Alignment.CENTER,
                     bgcolor=ft.Colors.BLACK,
-                    content=ft.Stack(
-                        expand=True,
-                        fit=ft.StackFit.EXPAND,
-                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                        controls=stack_controls,
-                    ),
+                    content=slide_row,
                 )
             )
 
@@ -3658,11 +5059,15 @@ def main(page: ft.Page) -> None:
         highlight_thumb(page_view.selected_index)
         sync_nav_buttons()
         _apply_exif_strip_positions()
+        _apply_all_blur_dup_strip_layouts()
         _apply_exif_bar_opacity()
+        _apply_blur_dup_strip_opacity()
         page.update()
         if paths:
             _apply_exif_strip_positions()
+            _apply_all_blur_dup_strip_layouts()
             _apply_exif_bar_opacity()
+            _apply_blur_dup_strip_opacity()
             page.update()
 
     def on_page_changed(e: ft.ControlEvent) -> None:
@@ -3678,6 +5083,7 @@ def main(page: ft.Page) -> None:
             return
         highlight_thumb(idx)
         sync_nav_buttons()
+        _apply_all_blur_dup_strip_layouts()
         page.update()
 
     page_view.on_change = on_page_changed
@@ -3827,8 +5233,13 @@ def main(page: ft.Page) -> None:
             return
         dest_path = Path(dest)
         try:
-            im = _compose_image_with_exif_strip(
-                path, merged, _get_exif_filter(), **_exif_strip_export_kwargs()
+            im = _compose_strip_export_image(
+                path,
+                merged,
+                _get_exif_filter(),
+                export_kw=dict(_exif_strip_export_kwargs()),
+                blur_dup_side=blur_dup_sw.value,
+                draw_exif_strip=exif_show_strip.value,
             )
             sfx = dest_path.suffix.lower()
             if sfx in (".jpg", ".jpeg"):
@@ -3896,11 +5307,13 @@ def main(page: ft.Page) -> None:
                 dest = base / f"{src.stem}_exif_{j}{src.suffix}"
                 j += 1
             try:
-                im = _compose_image_with_exif_strip(
+                im = _compose_strip_export_image(
                     str(src),
                     merged_i,
                     filt,
-                    **_exif_strip_export_kwargs(slide_index=i),
+                    export_kw=dict(_exif_strip_export_kwargs(slide_index=i)),
+                    blur_dup_side=blur_dup_sw.value,
+                    draw_exif_strip=exif_show_strip.value,
                 )
                 if dest.suffix.lower() in (".jpg", ".jpeg"):
                     im.save(str(dest), quality=92)
@@ -3956,9 +5369,25 @@ def main(page: ft.Page) -> None:
             dest_path = dest_path.with_suffix(".pdf")
         _show_gallery_loading(tr("loading_pdf"))
         try:
+            filt_pdf = _get_exif_filter()
+            merges_pdf = [
+                dict(slide_merges[i]) if i < len(slide_merges) else {}
+                for i in range(len(gallery_paths))
+            ]
+            kw_pdf = [
+                dict(_exif_strip_export_kwargs(slide_index=i))
+                for i in range(len(gallery_paths))
+            ]
             await asyncio.sleep(0)
             n_ok, n_skip = await asyncio.to_thread(
-                _write_gallery_pdf, gallery_paths, dest_path
+                _write_gallery_pdf,
+                gallery_paths,
+                dest_path,
+                merges_pdf,
+                filt_pdf,
+                exif_show_strip.value,
+                blur_dup_sw.value,
+                kw_pdf,
             )
         except ValueError:
             page.snack_bar = ft.SnackBar(
@@ -4046,11 +5475,13 @@ def main(page: ft.Page) -> None:
                 dest = base / f"{src.stem}_exif_{j}{src.suffix}"
                 j += 1
             try:
-                im = _compose_image_with_exif_strip(
+                im = _compose_strip_export_image(
                     str(src),
                     merged_i,
                     filt,
-                    **_exif_strip_export_kwargs(slide_index=i),
+                    export_kw=dict(_exif_strip_export_kwargs(slide_index=i)),
+                    blur_dup_side=blur_dup_sw.value,
+                    draw_exif_strip=exif_show_strip.value,
                 )
                 if dest.suffix.lower() in (".jpg", ".jpeg"):
                     im.save(str(dest), quality=92)
@@ -4379,6 +5810,7 @@ def main(page: ft.Page) -> None:
                             spacing=2,
                             controls=[
                                 _toggle_row(tr("label_exif_strip"), exif_show_strip),
+                                _toggle_row(tr("blur_dup_toggle"), blur_dup_sw),
                                 _toggle_row(tr("exif_sw_make"), exif_sw_make),
                                 _toggle_row(tr("exif_sw_model"), exif_sw_model),
                                 _toggle_row(tr("exif_sw_aperture"), exif_sw_aperture),
@@ -4521,6 +5953,7 @@ def main(page: ft.Page) -> None:
 
     def on_page_resize(_: ft.PageResizeEvent) -> None:
         _apply_exif_strip_positions()
+        _apply_all_blur_dup_strip_layouts()
         page.update()
 
     page.on_resize = on_page_resize
